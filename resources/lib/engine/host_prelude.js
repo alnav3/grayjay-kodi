@@ -29,17 +29,104 @@
     time: _noop, timeEnd: _noop, timeLog: _noop,
   };
 
-  // ---- timers ------------------------------------------------------------
-  // Grayjay's V8 host provides global timers; quickjs does not, and plugins
-  // assert setTimeout exists. There is no event loop here, and Grayjay source
-  // methods are synchronous, so deferred callbacks (mostly JSDOM event/abort
-  // plumbing) are not awaited on the scraping path — accept and drop them.
-  var _timerId = 1;
-  global.setTimeout = function (fn, delay) { return _timerId++; };
-  global.clearTimeout = function (id) {};
-  global.setInterval = function (fn, delay) { return _timerId++; };
-  global.clearInterval = function (id) {};
+  // ---- event loop --------------------------------------------------------
+  // quickjs has no event loop. Most Grayjay source methods are synchronous,
+  // but YouTube's PO-token (BotGuard) flow is genuinely asynchronous: it defers
+  // work with setTimeout and chains Promises, and getContentDetails returns a
+  // Promise. So we keep a real timer queue here and let the Python host *drive*
+  // it (drain the microtask/job queue, then fire the earliest timer) until the
+  // awaited method settles — see jsengine.run_async / __bridge_async_result.
+  // Time is virtual: `delay` only orders callbacks; it is never slept on.
+  var _timers = [];
+  var _timerSeq = 1;
+  var _clock = 0;
+  function _schedule(fn, delay, args, repeat) {
+    if (typeof fn !== "function") return 0;
+    var id = _timerSeq++;
+    _timers.push({ id: id, fn: fn, time: _clock + (delay || 0),
+                   repeat: repeat ? (delay || 0) : null, args: args || [] });
+    return id;
+  }
+  global.setTimeout = function (fn, delay) {
+    return _schedule(fn, delay, Array.prototype.slice.call(arguments, 2), false);
+  };
+  global.setInterval = function (fn, delay) {
+    return _schedule(fn, delay, Array.prototype.slice.call(arguments, 2), true);
+  };
+  global.clearTimeout = function (id) { _timers = _timers.filter(function (t) { return t.id !== id; }); };
+  global.clearInterval = global.clearTimeout;
+  // Microtask: keep synchronous (matches prior behaviour the scraping paths
+  // relied on; the host pump also drains real promise jobs around it).
   global.queueMicrotask = function (fn) { try { fn(); } catch (e) {} };
+  // Driver hooks invoked by the Python host pump (jsengine.py):
+  global.__pending_timers = function () { return _timers.length; };
+  global.__run_one_timer = function () {
+    if (_timers.length === 0) return false;
+    _timers.sort(function (a, b) { return a.time - b.time; });
+    var t = _timers.shift();
+    if (t.time > _clock) _clock = t.time;
+    if (t.repeat !== null) {
+      _timers.push({ id: t.id, fn: t.fn, time: _clock + t.repeat, repeat: t.repeat, args: t.args });
+    }
+    try { t.fn.apply(null, t.args); } catch (e) { global.log("[timer] " + ((e && e.stack) || e)); }
+    return true;
+  };
+
+  // ---- encoding polyfills (quickjs lacks these; BotGuard/JSDOM need them) --
+  // These are BINARY-safe (each char code is one byte) — unlike utility.*Base64
+  // which is UTF-8 — because the BotGuard attestation is raw binary in base64.
+  if (typeof global.btoa === "undefined") {
+    var _B64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    global.btoa = function (input) {
+      var str = String(input), out = "";
+      for (var block = 0, charCode, i = 0, map = _B64;
+           str.charAt(i | 0) || (map = "=", i % 1);
+           out += map.charAt(63 & block >> 8 - i % 1 * 8)) {
+        charCode = str.charCodeAt(i += 3 / 4);
+        if (charCode > 0xFF) throw new Error("btoa: character out of range");
+        block = block << 8 | charCode;
+      }
+      return out;
+    };
+    global.atob = function (input) {
+      var str = String(input).replace(/[=]+$/, ""), out = "";
+      if (str.length % 4 === 1) throw new Error("atob: invalid length");
+      for (var bc = 0, bs = 0, buffer, i = 0;
+           (buffer = str.charAt(i++));
+           ~buffer && (bs = bc % 4 ? bs * 64 + buffer : buffer, bc++ % 4)
+             ? out += String.fromCharCode(255 & bs >> (-2 * bc & 6)) : 0) {
+        buffer = _B64.indexOf(buffer);
+      }
+      return out;
+    };
+  }
+  if (typeof global.TextEncoder === "undefined") {
+    global.TextEncoder = function () {};
+    global.TextEncoder.prototype.encode = function (s) {
+      var b = unescape(encodeURIComponent(String(s)));   // UTF-8 byte string
+      var u = new Uint8Array(b.length);
+      for (var i = 0; i < b.length; i++) u[i] = b.charCodeAt(i);
+      return u;
+    };
+  }
+  if (typeof global.TextDecoder === "undefined") {
+    global.TextDecoder = function () {};
+    global.TextDecoder.prototype.decode = function (buf) {
+      var bytes = (buf instanceof Uint8Array) ? buf
+        : (buf && buf.buffer ? new Uint8Array(buf.buffer) : new Uint8Array(buf || 0));
+      var s = "";
+      for (var i = 0; i < bytes.length; i++) s += String.fromCharCode(bytes[i]);
+      return decodeURIComponent(escape(s));
+    };
+  }
+  if (typeof global.crypto === "undefined") {
+    global.crypto = {
+      getRandomValues: function (arr) {
+        for (var i = 0; i < arr.length; i++) arr[i] = Math.floor(Math.random() * 256);
+        return arr;
+      },
+    };
+  }
 
   // ---- missing engine globals (quickjs lacks these; JSDOM needs them) -----
   if (typeof global.FinalizationRegistry === "undefined") {
@@ -162,7 +249,24 @@
     if (typeof url !== "string") throw new TypeError("Invalid URL");
     var resolved = _resolve(url, base);
     var m = /^([^:/?#]+:)\/\/(?:([^:@/?#]*)(?::([^@/?#]*))?@)?([^:/?#]*)(?::(\d+))?([^?#]*)(\?[^#]*)?(#.*)?$/.exec(resolved);
-    if (!m) throw new TypeError("Invalid URL: " + url);
+    if (!m) {
+      // Opaque / non-authority URLs (about:blank, data:, blob:, mailto:, etc.).
+      // JSDOM uses about:blank as its default document URL, so we must not throw.
+      var op = /^([^:/?#]+:)([^?#]*)(\?[^#]*)?(#.*)?$/.exec(resolved);
+      if (op) {
+        this.protocol = op[1] || "";
+        this.username = ""; this.password = "";
+        this.hostname = ""; this.port = ""; this.host = "";
+        this.pathname = op[2] || "";
+        this.search = op[3] || "";
+        this.hash = op[4] || "";
+        this.origin = "null";
+        this.searchParams = new _MiniSearchParams(this.search);
+        this.href = resolved;
+        return;
+      }
+      throw new TypeError("Invalid URL: " + url);
+    }
     this.protocol = m[1] || "";
     this.username = m[2] || "";
     this.password = m[3] || "";
@@ -179,7 +283,18 @@
   global.URL.prototype.toString = function () { return this.href; };
 
   // ---- plugin entry point (called by Python host) ------------------------
-  // Runs source.<method>(*args); flattens pager objects to plain data.
+  // Flatten pager objects to plain data; pass everything else through.
+  function __encode(out) {
+    if (out && typeof out.hasMorePagers === "function") {
+      return { __pager: true, results: out.results, hasMore: out.hasMore, context: out.context };
+    }
+    return out === undefined ? null : out;
+  }
+
+  // Runs source.<method>(*args). Synchronous results are returned immediately;
+  // a returned Promise (e.g. YouTube getContentDetails) is stashed and the host
+  // pumps the event loop, then collects it via __bridge_async_result().
+  global.__async_slot = null;
   global.__bridge_call = function (method, argsJson) {
     var args = argsJson ? JSON.parse(argsJson) : [];
     var fn = global.source[method];
@@ -187,9 +302,25 @@
       throw new Error("source." + method + " is not implemented by this plugin");
     }
     var out = fn.apply(global.source, args);
-    if (out && typeof out.hasMorePagers === "function") {
-      return JSON.stringify({ __pager: true, results: out.results, hasMore: out.hasMore, context: out.context });
+    if (out && typeof out.then === "function") {
+      var slot = { done: false, value: undefined, error: undefined };
+      out.then(
+        function (v) { slot.value = v; slot.done = true; },
+        function (e) { slot.error = (e && e.message) ? e.message : String(e); slot.done = true; }
+      );
+      global.__async_slot = slot;
+      return JSON.stringify({ __async: true });
     }
-    return JSON.stringify(out === undefined ? null : out);
+    return JSON.stringify(__encode(out));
+  };
+
+  // Polled by the host after each pump step. Reports pending / error / done.
+  global.__bridge_async_result = function () {
+    var slot = global.__async_slot;
+    if (!slot) return JSON.stringify({ __error: "no pending async call" });
+    if (!slot.done) return JSON.stringify({ __pending: true });
+    global.__async_slot = null;
+    if (slot.error !== undefined) return JSON.stringify({ __error: slot.error });
+    return JSON.stringify({ __done: true, result: __encode(slot.value) });
   };
 })(this);

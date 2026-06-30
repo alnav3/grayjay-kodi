@@ -92,6 +92,12 @@ class PluginBridge(object):
         # default urllib/python agent).
         if not any(k.lower() == "user-agent" for k in headers):
             headers["User-Agent"] = self._default_ua()
+        # Default a JSON content-type for bodied POST/PUT when the plugin didn't
+        # set one. Grayjay's native http client does this; without it YouTube's
+        # WEB innertube /player rejects the request (400 FAILED_PRECONDITION).
+        if body and method in ("POST", "PUT", "PATCH") \
+                and not any(k.lower() == "content-type" for k in headers):
+            headers["Content-Type"] = "application/json"
         try:
             if _requests is not None:
                 resp = _requests.request(method, url, headers=headers,
@@ -121,8 +127,13 @@ class PluginBridge(object):
 
     @staticmethod
     def _default_ua():
-        return ("Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 "
-                "(KHTML, like Gecko) Chrome/124.0 Mobile Safari/537.36")
+        # Desktop Chrome. Plugins that need a mobile/iOS/Android UA set it
+        # explicitly per request; the requests that omit a UA (e.g. YouTube's
+        # WEB innertube /player call) expect a *desktop browser* UA — a mobile
+        # default makes the WEB client context mismatch and YouTube returns
+        # 400 FAILED_PRECONDITION. Match the plugin's own USER_AGENT_WINDOWS.
+        return ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/110.0.0.0 Safari/537.36")
 
     def _host_b64encode(self, payload_json):
         data = json.loads(payload_json).get("data", "")
@@ -234,12 +245,35 @@ class PluginBridge(object):
         self.engine.eval(
             "if (source.enable) source.enable(%s, %s, %s);" % (conf, s, st)
         )
+        # source.enable may kick off async init (e.g. YouTube session client);
+        # let any queued promise jobs run so state is settled before first call.
+        try:
+            self.engine.drain_jobs()
+        except Exception:
+            pass
+
+    def _async_deadline(self):
+        """How long to pump the event loop for an async source method (s)."""
+        try:
+            from ..kodiutils import get_setting
+            return float(get_setting("async_timeout", "90"))
+        except Exception:
+            return 90.0
 
     def call(self, method, args=None):
-        """Invoke source.<method>(*args) and return the decoded result."""
+        """Invoke source.<method>(*args) and return the decoded result.
+
+        Most methods are synchronous, but some (notably YouTube's
+        getContentDetails, which drives the async BotGuard PO-token flow) return
+        a Promise; __bridge_call signals that with {__async:true} and we pump the
+        event loop until it settles.
+        """
         self.load()
         args_json = json.dumps(args or [])
         out = self.engine.eval(
             "__bridge_call(%s, %s)" % (json.dumps(method), json.dumps(args_json))
         )
-        return json.loads(out) if out else None
+        data = json.loads(out) if out else None
+        if isinstance(data, dict) and data.get("__async"):
+            return self.engine.run_async(deadline_s=self._async_deadline())
+        return data

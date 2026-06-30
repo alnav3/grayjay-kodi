@@ -153,6 +153,15 @@ class JSEngine(object):
     def _init_quickjs(self):
         import quickjs
         self._ctx = quickjs.Context()
+        # The YouTube BotGuard VM is deeply recursive; the default quickjs stack
+        # (~256KB) overflows running it. Give it room. Harmless elsewhere.
+        for setter, val in (("set_max_stack_size", 4 * 1024 * 1024),):
+            fn = getattr(self._ctx, setter, None)
+            if fn:
+                try:
+                    fn(val)
+                except Exception:
+                    pass
 
     def _qjs_eval(self, code):
         try:
@@ -163,6 +172,42 @@ class JSEngine(object):
     def _qjs_register(self, name, fn):
         # quickjs marshals args/returns as JSON-compatible primitives.
         self._ctx.add_callable(name, fn)
+
+    def _qjs_drain_jobs(self):
+        """Run the pending promise/microtask jobs; return how many ran."""
+        n = 0
+        while True:
+            try:
+                ran = self._ctx.execute_pending_job()
+            except Exception as exc:
+                raise JSError(str(exc))
+            if not ran:
+                return n
+            n += 1
+
+    def _qjs_run_async(self, deadline_s, max_iter):
+        """Drive the JS event loop (host_prelude timer queue + promise jobs)
+        until the pending async bridge call settles. Returns the decoded result
+        or raises JSError on rejection / timeout / stall."""
+        import json
+        import time
+        start = time.time()
+        it = 0
+        while True:
+            if (time.time() - start) > deadline_s or it > max_iter:
+                raise JSError("async call timed out after %.1fs (%d iters)"
+                              % (time.time() - start, it))
+            ran_jobs = self._qjs_drain_jobs()
+            res = json.loads(self._ctx.eval("__bridge_async_result()"))
+            if res.get("__done"):
+                return res.get("result")
+            if "__error" in res:
+                raise JSError(res["__error"])
+            ran_timer = bool(self._ctx.eval("__run_one_timer()"))
+            it += 1
+            if not ran_timer and ran_jobs == 0:
+                raise JSError("async call stalled: no pending jobs or timers "
+                              "but result never settled")
 
     def _qjs_call(self, fn_name, *json_args):
         # Call a JS function by name with already-JSON-encoded string args.
@@ -245,6 +290,22 @@ class JSEngine(object):
         if self.backend == "js2py":
             return self._j2p_call(fn_name, *json_args)
         return self._mr_call(fn_name, *json_args)
+
+    def run_async(self, deadline_s=60.0, max_iter=500000):
+        """Pump the event loop until a pending async bridge call settles.
+
+        Only the quickjs backend has a real event loop; the others run plugins
+        synchronously, so an async result there is unsupported.
+        """
+        if self.backend == "quickjs":
+            return self._qjs_run_async(deadline_s, max_iter)
+        raise JSError("async source methods require the quickjs backend")
+
+    def drain_jobs(self):
+        """Drain any pending promise/microtask jobs (quickjs only; else no-op)."""
+        if self.backend == "quickjs":
+            return self._qjs_drain_jobs()
+        return 0
 
     def prepare(self, code):
         """Apply backend-specific source fixups before eval.
