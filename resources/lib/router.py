@@ -331,16 +331,49 @@ class Router(object):
 
     # -- subscriptions (cross-platform) -----------------------------------
     def action_subscriptions(self):
-        """Aggregate recent content from every subscribed channel, across all
-        sources, newest first. This is the Grayjay-style unified feed."""
-        from .sources import subscriptions as subs
+        """Subscriptions landing: 'All' plus one feed per group, like Grayjay's
+        group tabs, then a management entry."""
+        from .sources import subscriptions as subs, groups as grp
         all_subs = subs.list_subscriptions()
         if not all_subs:
             self._render([(self.url_for(action="root"),
                            "No subscriptions yet — use 'Subscribe' on any video", False, "")])
             return
+        items = [(self.url_for(action="sub_feed"),
+                  "[ All ]  (%d)" % len(all_subs), True, "")]
+        for g in grp.list_groups():
+            n = len(g.get("members", []))
+            ctx = [
+                ("Manage group",
+                 "Container.Update(%s)" % self.url_for(action="group_manage", group=g["id"])),
+                ("Rename group",
+                 "RunPlugin(%s)" % self.url_for(action="group_rename", group=g["id"])),
+                ("Delete group",
+                 "RunPlugin(%s)" % self.url_for(action="group_delete", group=g["id"])),
+            ]
+            items.append((self.url_for(action="sub_feed", group=g["id"]),
+                          "%s  (%d)" % (g.get("name", g["id"]), n), True, "", None, ctx))
+        items.append((self.url_for(action="groups"), "[ Manage groups… ]", True, ""))
+        self._render(items)
+
+    def action_sub_feed(self):
+        """Aggregate recent content across subscribed channels, newest first.
+        With ?group=<id>, restrict to that group's members."""
+        from .sources import subscriptions as subs, groups as grp
+        group_id = self.args.get("group")
+        feed_subs = subs.list_subscriptions()
+        if group_id:
+            g = grp.get_group(group_id)
+            members = {(m.get("source"), m.get("url")) for m in (g or {}).get("members", [])}
+            feed_subs = [s for s in feed_subs
+                         if (s.get("source"), s.get("url")) in members]
+            if not feed_subs:
+                self._render([(self.url_for(action="subscriptions"),
+                               "This group has no channels yet — add some from 'Manage groups'",
+                               False, "")])
+                return
         collected = []
-        for s in all_subs:
+        for s in feed_subs:
             results = self._run(s["source"], "getChannelContents",
                                 [s["url"], None, None, [], None])
             for v in results:
@@ -349,6 +382,125 @@ class Router(object):
         collected.sort(key=lambda sv: (sv[1].get("datetime") or 0), reverse=True)
         items = [self._content_item(src, v, show_source=True) for src, v in collected]
         self._render(items, content_type="videos")
+
+    # -- subscription groups ----------------------------------------------
+    def action_groups(self):
+        """Management screen: list groups, create new ones."""
+        from .sources import groups as grp
+        items = [(self.url_for(action="group_create"), "[ Create group… ]", False, "")]
+        for g in grp.list_groups():
+            ctx = [
+                ("Rename group",
+                 "RunPlugin(%s)" % self.url_for(action="group_rename", group=g["id"])),
+                ("Delete group",
+                 "RunPlugin(%s)" % self.url_for(action="group_delete", group=g["id"])),
+            ]
+            items.append((self.url_for(action="group_manage", group=g["id"]),
+                          "%s  (%d)" % (g.get("name", g["id"]), len(g.get("members", []))),
+                          True, "", None, ctx))
+        self._render(items)
+
+    def action_group_create(self):
+        if not _HAS_KODI:
+            return
+        name = xbmcgui.Dialog().input("Group name")
+        if not name:
+            return
+        from .sources import groups as grp
+        g = grp.create_group(name)
+        notify("Created group %s" % g["name"])
+        # Offer to populate it straight away.
+        xbmc.executebuiltin("Container.Update(%s)" % self.url_for(action="group_manage", group=g["id"]))
+
+    def action_group_rename(self):
+        if not _HAS_KODI:
+            return
+        from .sources import groups as grp
+        group_id = self.args.get("group")
+        g = grp.get_group(group_id)
+        if not g:
+            return
+        name = xbmcgui.Dialog().input("Rename group", defaultt=g.get("name", ""))
+        if name and grp.rename_group(group_id, name):
+            notify("Renamed to %s" % name)
+        xbmc.executebuiltin("Container.Refresh")
+
+    def action_group_delete(self):
+        from .sources import groups as grp
+        group_id = self.args.get("group")
+        g = grp.get_group(group_id)
+        if not g:
+            return
+        if _HAS_KODI:
+            if not xbmcgui.Dialog().yesno("Delete group", "Delete '%s'?" % g.get("name", group_id)):
+                return
+        grp.delete_group(group_id)
+        notify("Deleted group")
+        if _HAS_KODI:
+            # Leave the (now-gone) group screen back to the groups list.
+            xbmc.executebuiltin("Container.Update(%s,replace)" % self.url_for(action="groups"))
+
+    def action_group_manage(self):
+        """A group's detail: its channels, plus add/remove entries."""
+        from .sources import groups as grp
+        group_id = self.args.get("group")
+        g = grp.get_group(group_id)
+        if not g:
+            self._render([(self.url_for(action="groups"), "Group not found", False, "")])
+            return
+        items = [
+            (self.url_for(action="group_addmembers", group=group_id),
+             "[ Add / remove channels… ]", False, ""),
+            (self.url_for(action="group_rename", group=group_id),
+             "[ Rename group ]", False, ""),
+        ]
+        for m in g.get("members", []):
+            label = m.get("name") or m.get("url")
+            ctx = [("Remove from group",
+                    "RunPlugin(%s)" % self.url_for(action="group_removemember",
+                                                   group=group_id,
+                                                   source=m.get("source"), url=m.get("url")))]
+            items.append((self.url_for(action="channel", source=m.get("source"),
+                                       url=m.get("url"), name=m.get("name", "")),
+                          label, True, "", None, ctx))
+        self._render(items)
+
+    def action_group_addmembers(self):
+        """Multiselect every subscription; the picked set becomes the group's
+        members (pre-checking current members)."""
+        if not _HAS_KODI:
+            return
+        from .sources import subscriptions as subs, groups as grp
+        group_id = self.args.get("group")
+        g = grp.get_group(group_id)
+        if not g:
+            return
+        all_subs = subs.list_subscriptions()
+        if not all_subs:
+            notify("No subscriptions to add")
+            return
+        labels = ["%s  ·  %s" % (s.get("name") or s.get("url"),
+                                 self._source_name(s.get("source"))) for s in all_subs]
+        current = {(m.get("source"), m.get("url")) for m in g.get("members", [])}
+        preselect = [i for i, s in enumerate(all_subs)
+                     if (s.get("source"), s.get("url")) in current]
+        chosen = xbmcgui.Dialog().multiselect("Channels in '%s'" % g.get("name", group_id),
+                                              labels, preselect=preselect)
+        if chosen is None:  # cancelled
+            return
+        members = [{"source": all_subs[i].get("source"), "url": all_subs[i].get("url"),
+                    "name": all_subs[i].get("name", "")} for i in chosen]
+        grp.set_members(group_id, members)
+        notify("%d channel(s) in %s" % (len(members), g.get("name", group_id)))
+        xbmc.executebuiltin("Container.Update(%s,replace)" % self.url_for(action="group_manage", group=group_id))
+
+    def action_group_removemember(self):
+        from .sources import groups as grp
+        group_id = self.args.get("group")
+        if grp.remove_member(group_id, self.args.get("source"), self.args.get("url")):
+            notify("Removed from group")
+        if _HAS_KODI:
+            xbmc.executebuiltin("Container.Refresh")
 
     def action_subscribe(self):
         from .sources import subscriptions as subs
@@ -383,12 +535,42 @@ class Router(object):
         if subs.is_subscribed(source_id, url):
             items.append((self.url_for(action="unsubscribe", source=source_id, url=url),
                           "[ Unsubscribe ]", False, ""))
+            items.append((self.url_for(action="channel_groups", source=source_id, url=url, name=name),
+                          "[ Add to groups… ]", False, ""))
         else:
             items.append((self.url_for(action="subscribe", source=source_id, url=url, name=name),
                           "[ Subscribe ]", False, ""))
         for v in self._run(source_id, "getChannelContents", [url, None, None, [], None]):
             items.append(self._content_item(source_id, v))
         self._render(items, content_type="videos")
+
+    def action_channel_groups(self):
+        """Toggle this channel's membership across all groups via multiselect."""
+        if not _HAS_KODI:
+            return
+        from .sources import groups as grp
+        source_id = self.args.get("source")
+        url = self.args.get("url")
+        name = self.args.get("name", "")
+        all_groups = grp.list_groups()
+        if not all_groups:
+            if xbmcgui.Dialog().yesno("No groups", "No groups exist yet. Create one now?"):
+                self.action_group_create()
+            return
+        labels = ["%s  (%d)" % (g.get("name", g["id"]), len(g.get("members", []))) for g in all_groups]
+        preselect = [i for i, g in enumerate(all_groups) if grp.is_member(g["id"], source_id, url)]
+        chosen = xbmcgui.Dialog().multiselect("Add '%s' to groups" % (name or url),
+                                              labels, preselect=preselect)
+        if chosen is None:
+            return
+        chosen = set(chosen)
+        for i, g in enumerate(all_groups):
+            if i in chosen:
+                grp.add_member(g["id"], source_id, url, name)
+            else:
+                grp.remove_member(g["id"], source_id, url)
+        notify("Updated groups for %s" % (name or url))
+        xbmc.executebuiltin("Container.Refresh")
 
     def _source_name(self, source_id):
         """Display name for a source id, cached for the request."""
@@ -480,31 +662,93 @@ class Router(object):
         bridge = PluginBridge(cfg)
         bridge.enable(settings=plugin_settings.load(cfg))
         details = bridge.call("getContentDetails", [content_url])
+
+        # Preferred: a ready-made manifest/progressive URL (PeerTube HLS, etc.).
         play_url = self._pick_stream(details)
-        if not play_url:
-            notify("No playable stream found")
+        if play_url:
+            if _HAS_KODI:
+                li = xbmcgui.ListItem(path=play_url)
+                xbmcplugin.setResolvedUrl(self.handle, True, li)
+            else:
+                log("would play: %s" % play_url, "info")
             return
-        if _HAS_KODI:
-            li = xbmcgui.ListItem(path=play_url)
-            xbmcplugin.setResolvedUrl(self.handle, True, li)
-        else:
-            log("would play: %s" % play_url, "info")
+
+        # Fallback: adaptive video-only + audio-only tracks (YouTube). Build a
+        # DASH manifest from the direct-URL formats harvested off the player
+        # response and let inputstream.adaptive mux them.
+        mpd_path = self._build_dash(cfg, bridge, details)
+        if mpd_path:
+            if _HAS_KODI:
+                li = xbmcgui.ListItem(path=mpd_path)
+                li.setMimeType("application/dash+xml")
+                li.setContentLookup(False)
+                li.setProperty("inputstream", "inputstream.adaptive")
+                li.setProperty("inputstream.adaptive.manifest_type", "mpd")
+                xbmcplugin.setResolvedUrl(self.handle, True, li)
+            else:
+                log("would play DASH manifest: %s" % mpd_path, "info")
+            return
+
+        notify("No playable stream found")
+
+    def _build_dash(self, cfg, bridge, details):
+        """Synthesise a DASH MPD from harvested adaptive formats; return a path
+        to the written manifest, or None."""
+        from .playback import mpd as mpd_builder
+        from .kodiutils import profile_path
+        import os
+
+        formats = bridge.harvested_streams()
+        if not formats:
+            return None
+        dur_ms = 0
+        try:
+            dur_ms = int((details or {}).get("duration") or 0) * 1000
+        except (TypeError, ValueError):
+            dur_ms = 0
+        manifest = mpd_builder.build_mpd(formats, dur_ms or None)
+        if not manifest:
+            return None
+        cache = os.path.join(profile_path(), "cache")
+        if not os.path.isdir(cache):
+            os.makedirs(cache)
+        path = os.path.join(cache, "stream_%s.mpd" % cfg.id)
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(manifest)
+        return path
 
     def _pick_stream(self, details):
+        """Pick a directly-playable URL: a real HLS/DASH *manifest* or a muxed
+        progressive stream. Returns None for adaptive raw/ABR tracks (e.g.
+        YouTube's video-only DashRawSource) — those are handled by _build_dash,
+        which combines them with the audio track into a manifest."""
         if not details:
             return None
         desc = details.get("video") or {}
         sources = desc.get("videoSources") or []
+
         # source.js tags the class via `plugin_type` (Grayjay), older shims via
-        # `type`. Prefer adaptive HLS/DASH, then highest-res progressive.
+        # `type`.
         def kind(s):
             return s.get("plugin_type") or s.get("type") or ""
+
+        # Raw adaptive tracks are not independently playable (video-only / SABR).
+        def is_raw(k):
+            return "Raw" in k or "ABR" in k
+
+        # A real manifest source (HLSSource / DashManifestSource) points at an
+        # .m3u8/.mpd we can hand straight to Kodi.
         for s in sources:
             k = kind(s)
-            if "HLS" in k or "Dash" in k or "DASH" in k:
+            if is_raw(k):
+                continue
+            if "HLS" in k or "Manifest" in k:
                 return s.get("url")
+        # Otherwise the best muxed progressive stream (highest resolution).
         best, best_h = None, -1
         for s in sources:
+            if is_raw(kind(s)):
+                continue
             h = s.get("height") or 0
             if h >= best_h and s.get("url"):
                 best, best_h = s.get("url"), h

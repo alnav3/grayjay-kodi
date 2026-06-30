@@ -66,6 +66,7 @@ class PluginBridge(object):
         self.engine = JSEngine()
         self._loaded = False
         self.settings = {}             # per-source plugin settings (by variable)
+        self._stream_harvest = []      # adaptive formats sniffed from responses
         from .dom import DOMRegistry
         self._dom = DOMRegistry()
 
@@ -103,6 +104,7 @@ class PluginBridge(object):
                 resp = _requests.request(method, url, headers=headers,
                                          data=body, timeout=20, allow_redirects=True,
                                          verify=_CA_BUNDLE)
+                self._harvest_streams(url, resp.status_code, resp.text)
                 return json.dumps({
                     "url": resp.url, "code": resp.status_code,
                     "headers": dict(resp.headers), "body": resp.text,
@@ -119,11 +121,36 @@ class PluginBridge(object):
                                    "headers": dict(he.headers or {}), "body": body_txt})
             with r:
                 raw = r.read().decode("utf-8", "replace")
+                self._harvest_streams(url, r.status, raw)
                 return json.dumps({"url": r.geturl(), "code": r.status,
                                    "headers": dict(r.headers), "body": raw})
         except Exception as exc:
             log("http error %s: %s" % (url, exc), "warning")
             return json.dumps({"url": url, "code": 0, "headers": {}, "body": "", "error": str(exc)})
+
+    def _harvest_streams(self, url, code, body):
+        """Sniff direct-URL adaptive formats from a YouTube player response.
+
+        The plugin returns adaptive sources to us with deciphered *video* URLs
+        but no audio URLs (audio is meant to be muxed JS-side via SABR). The raw
+        ANDROID_VR `youtubei/v1/player` response, however, carries direct,
+        range-able URLs for *both* video and audio — exactly what we need to
+        synthesise a DASH manifest for inputstream.adaptive. Capture the last
+        such set so the router can build an MPD for playback. Best-effort and
+        YouTube-shaped; harmless (and inert) for other sources."""
+        if code != 200 or "youtubei/v1/player" not in (url or ""):
+            return
+        try:
+            data = json.loads(body)
+        except (ValueError, TypeError):
+            return
+        fmts = (data.get("streamingData") or {}).get("adaptiveFormats") or []
+        if any(f.get("url") for f in fmts):
+            self._stream_harvest = fmts
+
+    def harvested_streams(self):
+        """Adaptive formats (with direct URLs) seen on the last player call."""
+        return self._stream_harvest
 
     @staticmethod
     def _default_ua():
