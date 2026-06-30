@@ -141,6 +141,8 @@ class Router(object):
                  "RunPlugin(%s)" % self.url_for(action="source_settings", source=cfg.id)),
                 ("Update %s" % cfg.name,
                  "RunPlugin(%s)" % self.url_for(action="update_source", source=cfg.id)),
+                ("Remove %s" % cfg.name,
+                 "RunPlugin(%s)" % self.url_for(action="remove_source", source=cfg.id)),
             ]
             items.append((
                 self.url_for(action="home", source=cfg.id),
@@ -229,6 +231,23 @@ class Router(object):
             notify("Update failed: %s" % info["error"])
         else:
             notify("%s is up to date" % cfg.name)
+        if _HAS_KODI:
+            xbmc.executebuiltin("Container.Refresh")
+
+    def action_remove_source(self):
+        """Uninstall a source (with confirmation) from its context menu."""
+        from .sources import manager
+        source_id = self.args.get("source")
+        cfg = manager.get_source(source_id)
+        if cfg is None:
+            notify("Source not found")
+            return
+        if _HAS_KODI:
+            if not xbmcgui.Dialog().yesno("Remove source",
+                                          "Remove '%s'? Its subscriptions are kept." % cfg.name):
+                return
+        if manager.remove_source(source_id):
+            notify("Removed %s" % cfg.name)
         if _HAS_KODI:
             xbmc.executebuiltin("Container.Refresh")
 
@@ -673,23 +692,53 @@ class Router(object):
                 log("would play: %s" % play_url, "info")
             return
 
-        # Fallback: adaptive video-only + audio-only tracks (YouTube). Build a
+        # Fallback A: a muxed (progressive) stream — a single URL Kodi's native
+        # player handles directly, no inputstream.adaptive needed. Reliable but
+        # capped at the qualities YouTube still muxes (usually 360p, itag 18).
+        muxed_url = self._pick_muxed(bridge)
+        if muxed_url:
+            if _HAS_KODI:
+                li = xbmcgui.ListItem(path=muxed_url)
+                li.setContentLookup(False)
+                xbmcplugin.setResolvedUrl(self.handle, True, li)
+            else:
+                log("would play muxed: %s" % muxed_url, "info")
+            return
+
+        # Fallback B: adaptive video-only + audio-only tracks (YouTube). Build a
         # DASH manifest from the direct-URL formats harvested off the player
         # response and let inputstream.adaptive mux them.
         mpd_path = self._build_dash(cfg, bridge, details)
         if mpd_path:
+            # inputstream.adaptive fetches the manifest through its own (CURL)
+            # downloader, which needs a URL *scheme* — a bare /storage/… path
+            # fails with "Download failed, internal error". Hand it a file:// URL.
+            manifest_url = "file://" + mpd_path
             if _HAS_KODI:
-                li = xbmcgui.ListItem(path=mpd_path)
+                li = xbmcgui.ListItem(path=manifest_url)
                 li.setMimeType("application/dash+xml")
                 li.setContentLookup(False)
                 li.setProperty("inputstream", "inputstream.adaptive")
                 li.setProperty("inputstream.adaptive.manifest_type", "mpd")
                 xbmcplugin.setResolvedUrl(self.handle, True, li)
             else:
-                log("would play DASH manifest: %s" % mpd_path, "info")
+                log("would play DASH manifest: %s" % manifest_url, "info")
             return
 
         notify("No playable stream found")
+
+    def _pick_muxed(self, bridge):
+        """Highest-resolution muxed/progressive URL harvested from the player
+        response (single audio+video stream), or None."""
+        muxed = bridge.harvested_muxed() if hasattr(bridge, "harvested_muxed") else []
+        best, best_h = None, -1
+        for f in muxed or []:
+            if not f.get("url"):
+                continue
+            h = f.get("height") or 0
+            if h >= best_h:
+                best, best_h = f.get("url"), h
+        return best
 
     def _build_dash(self, cfg, bridge, details):
         """Synthesise a DASH MPD from harvested adaptive formats; return a path

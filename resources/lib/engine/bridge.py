@@ -67,6 +67,7 @@ class PluginBridge(object):
         self._loaded = False
         self.settings = {}             # per-source plugin settings (by variable)
         self._stream_harvest = []      # adaptive formats sniffed from responses
+        self._muxed_harvest = []       # muxed (progressive) formats sniffed
         from .dom import DOMRegistry
         self._dom = DOMRegistry()
 
@@ -144,13 +145,23 @@ class PluginBridge(object):
             data = json.loads(body)
         except (ValueError, TypeError):
             return
-        fmts = (data.get("streamingData") or {}).get("adaptiveFormats") or []
+        sd = data.get("streamingData") or {}
+        fmts = sd.get("adaptiveFormats") or []
         if any(f.get("url") for f in fmts):
+            # Same response's muxed (progressive) formats — kept together so the
+            # muxed URLs come from the client that returns direct URLs
+            # (ANDROID_VR), not the SABR-only WEB response.
             self._stream_harvest = fmts
+            self._muxed_harvest = [f for f in (sd.get("formats") or [])
+                                   if f.get("url")]
 
     def harvested_streams(self):
         """Adaptive formats (with direct URLs) seen on the last player call."""
         return self._stream_harvest
+
+    def harvested_muxed(self):
+        """Muxed/progressive formats (with direct URLs) — single playable URLs."""
+        return self._muxed_harvest
 
     @staticmethod
     def _default_ua():
