@@ -63,6 +63,14 @@ piwheels** (Raspberry Pi's repo), vendored under
 ## Status / TODO
 
 - [x] Addon scaffold, routing, source install/list/remove
+- [x] **One-click official sources** — "Add source" opens a submenu to either
+      paste a config URL or pick from FUTO's first-party plugins (Odysee,
+      Rumble, PeerTube, Twitch, SoundCloud, Spotify, …); list in
+      `resources/lib/sources/official.py`. Installs are signature-verified and
+      auto-update like any other source.
+- [x] **Official Grayjay branding** — `resources/icon.png` is FUTO's 512×512
+      app icon; `resources/fanart.png` is a 1080p board built from the official
+      mark on the brand background.
 - [x] JS engine abstraction + Grayjay SDK scaffolding (`packages.js`)
 - [x] Host HTTP / log / base64 / uuid / md5 bridge
 - [x] Off-Kodi test harness (`tools/harness.py`)
@@ -80,13 +88,30 @@ piwheels** (Raspberry Pi's repo), vendored under
       (`http`, `utility`, `bridge`, `domParser`) and a `URL` polyfill.
 - [x] **Runs real signed community plugins.** PeerTube: `getHome` → 20 real
       videos; `getContentDetails` → real HLS stream URL, end to end on the box.
-- [ ] Per-plugin gaps: YouTube bundles a minified JSDOM whose regex quickjs
-      rejects (stricter Annex-B than V8) — parse-time fail; Rumble is bot-blocked
-      (307); Odysee hits a missing host function. Lighter API plugins work best.
+- [~] **YouTube** — loads, enables (4.25 MB incl. bundled JSDOM) and runs:
+      `search`, `searchSuggestions`, channels and video metadata all return real
+      data. Required engine work: rewrite `\-` in `/u` regex classes to `\x2d`
+      (quickjs is stricter than V8); `setTimeout`/`WeakRef`/`FinalizationRegistry`
+      stubs; `URL` polyfill; `utility.md5String`; `bridge.isLoggedIn()`; full
+      `http.batch().DUMMY` BatchBuilder (un-gates the session client). The
+      signature **cipher (sig+nsig) solves** via FUTO's remote solver. Remaining
+      blocker: playable stream formats come back empty — YouTube **PO Token /
+      BotGuard** gating, separate from the cipher and the current industry-wide
+      frontier (needs an external PO-token/BotGuard provider).
+- [ ] Other per-plugin gaps: Rumble is bot-blocked (307); Odysee hits a missing
+      host function. Lighter API plugins (PeerTube) work best.
 - [x] **Cross-platform subscriptions** — subscribe to a channel *via this addon*
       (not the upstream platform); the "Subscriptions" feed aggregates newest
       content from all followed channels across every installed source. Right-
       click any video → Subscribe / Go to channel.
+- [x] **Source auto-update** — a background service (`service.py`) re-fetches
+      each source's config from its canonical `sourceUrl` (falling back to the
+      URL it was installed from), and when the remote `version` is newer it
+      downloads the new script, **re-verifies the signature, and only then swaps
+      the files** — a bad signature or a failed fetch leaves the working copy
+      untouched. Interval + on/off are in Settings → Updates; also triggerable
+      manually via the root menu's "Check for updates…" and a per-source
+      "Update" context-menu entry.
 - [ ] Pager `nextPage()` continuation across Kodi page loads
 - [ ] Settings persistence per source, auth/login flows
 - [ ] Channels, playlists, search capabilities UI
@@ -101,9 +126,12 @@ bundled JSDOM regex; sites with bot protection).
 
 ## Security
 
-Grayjay signs plugin scripts; **this host does not yet verify those
-signatures**, and it grants plugins network access (scoped by the plugin's
-declared `allowUrls`). Only install sources you trust until signing lands.
+Grayjay signs plugin scripts, and **this host verifies those signatures**
+(pure-Python RSASSA-PKCS1-v1.5/SHA-512, matching FUTO's `SignatureProvider`)
+against the exact downloaded bytes — enforced at install *and* on every
+auto-update, before anything is written to disk. Unsigned sources are allowed
+but logged as a risk. Plugins get network access scoped by their declared
+`allowUrls`. Still: only install sources you trust.
 
 ## Development
 
