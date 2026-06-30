@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="utf-8" standalone="yes"?>
+<settings version="1">
+    <section id="plugin.video.grayjay">
+        <category id="general" label="General">
+            <group id="1">
+                <setting id="http_timeout" type="integer" label="HTTP timeout (seconds)">
+                    <level>0</level>
+                    <default>20</default>
+                    <constraints>
+                        <minimum>5</minimum>
+                        <maximum>120</maximum>
+                    </constraints>
+                    <control type="slider" format="integer"/>
+                </setting>
+                <setting id="verify_signatures" type="boolean" label="Verify plugin signatures (not yet implemented)">
+                    <level>0</level>
+                    <default>false</default>
+                    <control type="toggle"/>
+                </setting>
+            </group>
+        </category>
+    </section>
+</settings>

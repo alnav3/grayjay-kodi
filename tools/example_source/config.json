@@ -1,0 +1,15 @@
+{
+  "name": "Example",
+  "description": "Tiny offline source for testing the host (no network).",
+  "author": "grayjay-kodi",
+  "authorUrl": "https://github.com/grayjay-kodi",
+  "sourceUrl": "https://example.com/config.json",
+  "repositoryUrl": "https://github.com/grayjay-kodi",
+  "scriptUrl": "./script.js",
+  "version": 1,
+  "iconUrl": "",
+  "id": "example",
+  "packages": [],
+  "allowEval": false,
+  "allowUrls": ["everywhere"]
+}

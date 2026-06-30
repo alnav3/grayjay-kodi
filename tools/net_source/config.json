@@ -1,0 +1,12 @@
+{
+  "name": "NetTest",
+  "description": "Exercises the host HTTP bridge with a real request.",
+  "author": "grayjay-kodi",
+  "sourceUrl": "https://example.com/config.json",
+  "scriptUrl": "./script.js",
+  "version": 1,
+  "id": "nettest",
+  "packages": [],
+  "allowEval": false,
+  "allowUrls": ["everywhere"]
+}

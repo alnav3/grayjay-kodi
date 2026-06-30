@@ -1,0 +1,19 @@
+msgid ""
+msgstr ""
+"Project-Id-Version: plugin.video.grayjay\n"
+"Language: en_GB\n"
+"MIME-Version: 1.0\n"
+"Content-Type: text/plain; charset=UTF-8\n"
+"Content-Transfer-Encoding: 8bit\n"
+
+msgctxt "#30000"
+msgid "Grayjay"
+msgstr ""
+
+msgctxt "#30001"
+msgid "Add source…"
+msgstr ""
+
+msgctxt "#30002"
+msgid "Search"
+msgstr ""

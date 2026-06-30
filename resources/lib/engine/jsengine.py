@@ -1,0 +1,185 @@
+# -*- coding: utf-8 -*-
+"""Pluggable JavaScript engine abstraction.
+
+Grayjay source plugins are JavaScript executed against an embedded engine
+(Grayjay itself uses V8). Inside Kodi we only have CPython, so we need a JS
+runtime reachable from Python that also lets JS call *back* into Python
+(HTTP, logging, crypto). Two backends are supported, in preference order:
+
+1. ``quickjs``      - QuickJS bindings. Small, pure-ish, supports host
+                      callables. Easiest to ship as an aarch64 wheel.
+2. ``py_mini_racer`` - V8 bindings. Fast and battle-tested but eval-only
+                      (no synchronous host callbacks), so HTTP has to be
+                      pre-resolved. Used only as a fallback.
+3. ``js2py``        - Pure Python (ES5/6). Slow and partial, but needs no
+                      compiler and can be VENDORED into the addon, so it runs
+                      on locked-down targets (e.g. CoreELEC: no pip/compiler).
+                      Supports host callables. Default fallback on such boxes.
+
+The native backends need a build matching Kodi's bundled Python ABI on the
+target arch; js2py sidesteps that entirely. See README.md.
+"""
+import os
+import sys
+
+# Allow a vendored copy of pure-Python deps (js2py + pyjsparser) to be shipped
+# inside the addon so no installation is needed on the target.
+_VENDOR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "vendor")
+if os.path.isdir(_VENDOR) and _VENDOR not in sys.path:
+    sys.path.insert(0, _VENDOR)
+
+from ..kodiutils import log
+
+
+class JSError(Exception):
+    pass
+
+
+class JSEngine(object):
+    """Common interface over whichever backend is available."""
+
+    def __init__(self):
+        self.backend = None
+        self._ctx = None
+        self._load_backend()
+
+    def _load_backend(self):
+        forced = os.environ.get("GRAYJAY_JS_BACKEND")
+        if forced:
+            init = {
+                "quickjs": self._init_quickjs,
+                "py_mini_racer": self._init_mini_racer,
+                "js2py": self._init_js2py,
+            }.get(forced)
+            if init is None:
+                raise JSError("Unknown GRAYJAY_JS_BACKEND=%s" % forced)
+            self.backend = forced
+            init()
+            log("JS backend: %s (forced)" % forced, "info")
+            return
+        try:
+            import quickjs  # noqa: F401
+            self.backend = "quickjs"
+            self._init_quickjs()
+            log("JS backend: quickjs", "info")
+            return
+        except ImportError:
+            pass
+        try:
+            import py_mini_racer  # noqa: F401
+            self.backend = "py_mini_racer"
+            self._init_mini_racer()
+            log("JS backend: py_mini_racer (host callbacks unavailable)", "warning")
+            return
+        except ImportError:
+            pass
+        try:
+            import js2py  # noqa: F401
+            self.backend = "js2py"
+            self._init_js2py()
+            log("JS backend: js2py (pure Python, slow)", "info")
+            return
+        except ImportError:
+            pass
+        raise JSError(
+            "No JavaScript engine available. Install 'quickjs' (preferred), "
+            "'py_mini_racer', or vendor 'js2py' into resources/lib/engine/vendor. "
+            "See README.md."
+        )
+
+    # -- quickjs ----------------------------------------------------------
+    def _init_quickjs(self):
+        import quickjs
+        self._ctx = quickjs.Context()
+
+    def _qjs_eval(self, code):
+        try:
+            return self._ctx.eval(code)
+        except Exception as exc:  # quickjs raises its own error types
+            raise JSError(str(exc))
+
+    def _qjs_register(self, name, fn):
+        # quickjs marshals args/returns as JSON-compatible primitives.
+        self._ctx.add_callable(name, fn)
+
+    def _qjs_call(self, fn_name, *json_args):
+        # Call a JS function by name with already-JSON-encoded string args.
+        import json
+        arg_list = ",".join(json_args)
+        code = "JSON.stringify((%s)(%s))" % (fn_name, arg_list)
+        out = self._qjs_eval(code)
+        return json.loads(out) if out is not None else None
+
+    # -- py_mini_racer ----------------------------------------------------
+    def _init_mini_racer(self):
+        import py_mini_racer
+        self._ctx = py_mini_racer.MiniRacer()
+
+    def _mr_eval(self, code):
+        try:
+            return self._ctx.eval(code)
+        except Exception as exc:
+            raise JSError(str(exc))
+
+    def _mr_register(self, name, fn):
+        raise JSError(
+            "py_mini_racer cannot register host callables; HTTP-driven "
+            "plugins require the quickjs backend."
+        )
+
+    def _mr_call(self, fn_name, *json_args):
+        import json
+        arg_list = ",".join(json_args)
+        code = "JSON.stringify((%s)(%s))" % (fn_name, arg_list)
+        out = self._mr_eval(code)
+        return json.loads(out) if out is not None else None
+
+    # -- js2py ------------------------------------------------------------
+    def _init_js2py(self):
+        import js2py
+        self._ctx = js2py.EvalJs(enable_require=False)
+
+    def _j2p_eval(self, code):
+        try:
+            res = self._ctx.eval(code)
+        except Exception as exc:
+            raise JSError(str(exc))
+        # js2py returns its own JsObjectWrapper / primitives; coerce to str
+        # when the caller asked for a JSON.stringify result.
+        if res is None:
+            return None
+        return str(res)
+
+    def _j2p_register(self, name, fn):
+        # Assigning a Python callable onto the context exposes it to JS.
+        setattr(self._ctx, name, fn)
+
+    def _j2p_call(self, fn_name, *json_args):
+        import json
+        arg_list = ",".join(json_args)
+        out = self._j2p_eval("JSON.stringify((%s)(%s))" % (fn_name, arg_list))
+        return json.loads(out) if out else None
+
+    # -- public api -------------------------------------------------------
+    def eval(self, code):
+        if self.backend == "quickjs":
+            return self._qjs_eval(code)
+        if self.backend == "js2py":
+            return self._j2p_eval(code)
+        return self._mr_eval(code)
+
+    def register(self, name, fn):
+        """Expose a Python callable to JS under a global name."""
+        if self.backend == "quickjs":
+            return self._qjs_register(name, fn)
+        if self.backend == "js2py":
+            return self._j2p_register(name, fn)
+        return self._mr_register(name, fn)
+
+    def call(self, fn_name, *json_args):
+        """Call a global JS function; args are pre-serialized JSON strings."""
+        if self.backend == "quickjs":
+            return self._qjs_call(fn_name, *json_args)
+        if self.backend == "js2py":
+            return self._j2p_call(fn_name, *json_args)
+        return self._mr_call(fn_name, *json_args)
