@@ -70,15 +70,28 @@
   Http.prototype.POST = function (url, body, headers, useAuth) { return this._req("POST", url, headers, body); };
   Http.prototype.request = function (method, url, headers, body) { return this._req(method, url, headers, body); };
   Http.prototype.requestWithBody = function (method, url, body, headers) { return this._req(method, url, headers, body); };
-  // Batch client: plugins call http.batch().GET(...).execute(). Run sequentially.
-  Http.prototype.batch = function () {
-    var self = this, queue = [];
-    return {
-      GET: function (u, h, a) { queue.push(["GET", u, h, null]); return this; },
-      POST: function (u, b, h, a) { queue.push(["POST", u, h, b]); return this; },
-      execute: function () { return queue.map(function (q) { return self._req(q[0], q[1], q[2], q[3]); }); },
-    };
+  // Batch client (Grayjay PackageHttp.BatchBuilder). Plugins chain
+  // .GET/.POST/.DUMMY/.clientGET(...) then .execute() -> array of responses
+  // (null for DUMMY slots). The presence of .DUMMY is what the YouTube plugin
+  // probes to enable its modern "session client". Run requests sequentially.
+  function BatchBuilder(httpClient) { this._http = httpClient; this._reqs = []; }
+  BatchBuilder.prototype.request = function (m, u, h, a) { this._reqs.push([m, u, h || {}, null]); return this; };
+  BatchBuilder.prototype.requestWithBody = function (m, u, b, h, a) { this._reqs.push([m, u, h || {}, b]); return this; };
+  BatchBuilder.prototype.GET = function (u, h, a) { this._reqs.push(["GET", u, h || {}, null]); return this; };
+  BatchBuilder.prototype.POST = function (u, b, h, a) { this._reqs.push(["POST", u, h || {}, b]); return this; };
+  BatchBuilder.prototype.DUMMY = function () { this._reqs.push(["DUMMY", "", {}, null]); return this; };
+  BatchBuilder.prototype.clientRequest = function (cid, m, u, h) { return this.request(m, u, h); };
+  BatchBuilder.prototype.clientRequestWithBody = function (cid, m, u, b, h) { return this.requestWithBody(m, u, b, h); };
+  BatchBuilder.prototype.clientGET = function (cid, u, h) { return this.GET(u, h); };
+  BatchBuilder.prototype.clientPOST = function (cid, u, b, h) { return this.POST(u, b, h); };
+  BatchBuilder.prototype.execute = function () {
+    var self = this;
+    return this._reqs.map(function (r) {
+      if (r[0] === "DUMMY") return null;
+      return self._http._req(r[0], r[1], r[2], r[3]);
+    });
   };
+  Http.prototype.batch = function () { return new BatchBuilder(this); };
   global.http = new Http(false);
   global.packageHttp = { newClient: function (useAuth) { return new Http(useAuth); }, getDefaultClient: function (a) { return new Http(a); } };
 
