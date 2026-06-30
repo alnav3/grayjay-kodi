@@ -5,6 +5,7 @@ Plugin URLs look like:
     plugin://plugin.video.grayjay/?action=home&source=<id>&page=<token>
     plugin://plugin.video.grayjay/?action=play&source=<id>&url=<contentUrl>
 """
+import time
 from urllib.parse import parse_qsl, urlencode
 
 from .kodiutils import log, notify, ADDON_ID
@@ -17,6 +18,56 @@ try:
 except ImportError:
     _HAS_KODI = False
     xbmc = xbmcgui = xbmcplugin = None
+
+
+# -- display formatting (Grayjay-style metadata) --------------------------
+def _human_count(n):
+    """Compact view count like Grayjay: 532, 12K, 1.2M, 3.4B."""
+    try:
+        n = int(n)
+    except (TypeError, ValueError):
+        return ""
+    for div, suffix in ((1_000_000_000, "B"), (1_000_000, "M"), (1_000, "K")):
+        if n >= div:
+            val = n / float(div)
+            # 12.0K -> 12K, 1.2M stays 1.2M
+            return ("%.1f" % val).rstrip("0").rstrip(".") + suffix
+    return str(n)
+
+
+def _relative_time(unix_seconds):
+    """'3 days ago' style age from a unix timestamp, Grayjay-style."""
+    try:
+        delta = int(time.time()) - int(unix_seconds)
+    except (TypeError, ValueError):
+        return ""
+    if delta < 0:
+        return "scheduled"
+    if delta < 60:
+        return "just now"
+    for secs, unit in ((31_536_000, "year"), (2_592_000, "month"),
+                       (604_800, "week"), (86_400, "day"),
+                       (3_600, "hour"), (60, "minute")):
+        if delta >= secs:
+            n = delta // secs
+            return "%d %s%s ago" % (n, unit, "" if n == 1 else "s")
+    return "just now"
+
+
+def _fmt_date(unix_seconds):
+    """YYYY-MM-DD (local) for Kodi's premiered/aired infolabel."""
+    try:
+        return time.strftime("%Y-%m-%d", time.localtime(int(unix_seconds)))
+    except (TypeError, ValueError, OSError):
+        return ""
+
+
+def _fmt_datetime(unix_seconds):
+    """YYYY-MM-DD HH:MM:SS (local) for Kodi's dateadded infolabel."""
+    try:
+        return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(int(unix_seconds)))
+    except (TypeError, ValueError, OSError):
+        return ""
 
 
 class Router(object):
@@ -221,6 +272,11 @@ class Router(object):
                     values[var] = pick
         plugin_settings.save(cfg, values)
         notify("Saved %s settings" % cfg.name)
+        # When opened as a clicked list item (has a directory handle), close the
+        # empty directory so Kodi stays put instead of waiting for a listing.
+        # When opened via the context menu (RunPlugin), handle is -1 — skip.
+        if _HAS_KODI and self.handle >= 0:
+            xbmcplugin.endOfDirectory(self.handle, succeeded=False)
 
     @staticmethod
     def _setting_label(desc, values):
@@ -250,6 +306,8 @@ class Router(object):
         items = [
             (self.url_for(action="search", source=source_id),
              "[ Search %s ]" % name, True, ""),
+            (self.url_for(action="source_settings", source=source_id),
+             "[ %s Settings ]" % name, False, ""),
         ]
         page = self.args.get("page") or None
         results = self._run(source_id, "getHome", [page])
@@ -463,13 +521,62 @@ class Router(object):
         for it in items:
             url, label, is_folder = it[0], it[1], it[2]
             thumb = it[3] if len(it) > 3 else ""
+            info = it[4] if len(it) > 4 else None
             context = it[5] if len(it) > 5 else None
             li = xbmcgui.ListItem(label=label)
             if thumb:
-                li.setArt({"thumb": thumb, "icon": thumb})
+                li.setArt({"thumb": thumb, "icon": thumb, "poster": thumb})
+            if isinstance(info, dict):
+                self._apply_video_info(li, label, info)
             if not is_folder:
                 li.setProperty("IsPlayable", "true")
             if context:
                 li.addContextMenuItems(context)
             xbmcplugin.addDirectoryItem(self.handle, url, li, is_folder)
         xbmcplugin.endOfDirectory(self.handle)
+
+    @staticmethod
+    def _apply_video_info(li, label, info):
+        """Map our metadata dict onto a Kodi ListItem. Uses InfoTagVideo (Kodi
+        20+/Omega) and falls back to setInfo on older builds. The Grayjay-style
+        '<source> • <channel> • <views> • <time>' line goes to label2 so skins
+        that show a second line render it; everything also lands in infolabels
+        (date/duration/plot) for skins and the info dialog."""
+        meta = info.get("label2")
+        if meta:
+            li.setLabel2(meta)
+        try:
+            vt = li.getVideoInfoTag()
+            vt.setMediaType("video")
+            vt.setTitle(label)
+            if info.get("plot"):
+                vt.setPlot(info["plot"])
+            if info.get("duration"):
+                vt.setDuration(info["duration"])
+            if info.get("studio"):
+                vt.setStudios([info["studio"]])
+            if info.get("author"):
+                vt.setDirectors([info["author"]])
+            if info.get("premiered"):
+                vt.setPremiered(info["premiered"])
+            if info.get("dateadded"):
+                vt.setDateAdded(info["dateadded"])
+        except Exception:
+            # Older Kodi without the InfoTagVideo setters.
+            data = {"mediatype": "video", "title": label}
+            if info.get("plot"):
+                data["plot"] = info["plot"]
+            if info.get("duration"):
+                data["duration"] = info["duration"]
+            if info.get("studio"):
+                data["studio"] = info["studio"]
+            if info.get("author"):
+                data["director"] = info["author"]
+            if info.get("premiered"):
+                data["premiered"] = info["premiered"]
+            if info.get("dateadded"):
+                data["dateadded"] = info["dateadded"]
+            try:
+                li.setInfo("video", data)
+            except Exception:
+                pass
