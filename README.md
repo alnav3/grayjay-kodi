@@ -58,13 +58,29 @@ Getting a working `quickjs` wheel onto the target is the main open task.
 - [x] JS engine abstraction + Grayjay SDK scaffolding (`packages.js`)
 - [x] Host HTTP / log / base64 / uuid / md5 bridge
 - [x] Off-Kodi test harness (`tools/harness.py`)
-- [ ] Ship a `quickjs` build for Kodi/aarch64 (blocking real plugin runs)
-- [ ] **Signature verification** (scriptSignature / scriptPublicKey) — currently
-      scripts are **not** verified. See Security.
-- [ ] `DOMParser` package (many plugins need it) — currently absent
+- [x] **Signature verification** — pure-Python RSASSA-PKCS1-v1.5/SHA-512,
+      matching Grayjay's `SignatureProvider`. Verified against FUTO's own test
+      vectors *and* the real signed YouTube plugin. Enforced at install + load.
+- [x] **`DOMParser` package** — bs4 + soupsieve backed `domParser`/`DOMNode`
+      (querySelector, getElementsBy*, attributes, ...), faithful to Grayjay's
+      jsoup API. Validated on the CoreELEC box.
+- [x] Installed + registered live in Kodi 21.3 on the target box
+- [ ] **Real JS engine — the blocker.** js2py cannot parse ES2020. The official
+      YouTube plugin uses `?.` (704×) and `??` (204×) and fails to load under
+      js2py. Need quickjs/V8 built for Kodi-Python/aarch64, or a transpile step.
 - [ ] Pager `nextPage()` continuation across Kodi page loads
 - [ ] Settings persistence per source, auth/login flows
 - [ ] Comments, channels, playlists, search capabilities UI
+
+### Engine reality check (tested on the box)
+
+Everything in the *host* works on the CoreELEC box under vendored js2py:
+signature verification (incl. catching a CRLF round-trip bug), DOMParser, the
+HTTP bridge, models and pagers. The remaining gap is purely the JS engine:
+**js2py's parser predates ES2020**, so modern real-world plugins won't even
+parse. The example/net/dom test sources (ES5) run fine; the YouTube plugin does
+not. Shipping a real engine is the one thing standing between this and running
+actual community sources.
 
 ## Security
 

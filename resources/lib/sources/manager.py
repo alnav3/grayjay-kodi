@@ -24,13 +24,19 @@ except ImportError:
 import urllib.request as _urlreq
 
 
+_UA = "Mozilla/5.0 (compatible; grayjay-kodi/0.1; +https://github.com/grayjay-kodi)"
+
+
 def _fetch(url):
+    """Fetch text as UTF-8. Decoding must be exact (and stable) because the
+    script bytes are what the plugin signature is verified against."""
     if _requests is not None:
-        r = _requests.get(url, timeout=20)
+        r = _requests.get(url, timeout=20, headers={"User-Agent": _UA})
         r.raise_for_status()
-        return r.text
-    with _urlreq.urlopen(url, timeout=20) as resp:
-        return resp.read().decode("utf-8", "replace")
+        return r.content.decode("utf-8")
+    req = _urlreq.Request(url, headers={"User-Agent": _UA})
+    with _urlreq.urlopen(req, timeout=20) as resp:
+        return resp.read().decode("utf-8")
 
 
 def list_sources():
@@ -74,12 +80,25 @@ def install_from_url(config_url):
     script = _fetch(script_url)
     with open(os.path.join(base_dir, "config.json"), "w", encoding="utf-8") as fh:
         json.dump(raw, fh, indent=2)
-    with open(os.path.join(base_dir, "script.js"), "w", encoding="utf-8") as fh:
+    # newline="" disables newline translation so the bytes (and any CRLF) are
+    # preserved exactly — the signature is verified against these exact bytes.
+    with open(os.path.join(base_dir, "script.js"), "w", encoding="utf-8", newline="") as fh:
         fh.write(script)
+
+    # Verify the signature at install time (Grayjay SignatureProvider).
+    cfg = SourceConfig.from_dir(base_dir)
+    ok, reason = cfg.validate(script)
+    if reason == "invalid":
+        shutil.rmtree(base_dir)
+        raise ValueError("Signature verification FAILED for %s — not installed" % source_id)
+    if reason == "unsigned":
+        log("Installed UNSIGNED source %s (security risk)" % source_id, "warning")
+    else:
+        log("Signature verified for %s" % source_id, "info")
 
     log("installed source %s v%s" % (source_id, raw.get("version")), "info")
     notify("Installed %s" % raw.get("name", source_id))
-    return SourceConfig.from_dir(base_dir)
+    return cfg
 
 
 def remove_source(source_id):

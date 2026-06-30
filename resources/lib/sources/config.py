@@ -40,6 +40,29 @@ class SourceConfig(object):
         return os.path.join(self.base_dir, "script.js")
 
     @property
+    def script_signature(self):
+        return self.raw.get("scriptSignature")
+
+    @property
+    def script_public_key(self):
+        return self.raw.get("scriptPublicKey")
+
+    def validate(self, script_text):
+        """Mirror Grayjay's SourcePluginConfig.validate / SignatureProvider.
+
+        Returns (ok, reason). `ok` is True only when a signature is present
+        and verifies. `reason` is "unsigned" when signing fields are absent
+        (caller decides whether to allow), or "invalid" on a bad signature.
+        """
+        if not self.script_public_key:
+            return False, "unsigned"
+        if not self.script_signature:
+            return False, "unsigned"
+        from ..crypto.rsa_verify import verify
+        ok = verify(script_text, self.script_signature, self.script_public_key)
+        return (ok, "valid" if ok else "invalid")
+
+    @property
     def allow_eval(self):
         return bool(self.raw.get("allowEval", False))
 

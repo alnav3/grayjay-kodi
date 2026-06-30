@@ -1,0 +1,12 @@
+{
+  "name": "DomTest",
+  "description": "Exercises the domParser package.",
+  "author": "grayjay-kodi",
+  "sourceUrl": "https://example.com/config.json",
+  "scriptUrl": "./script.js",
+  "version": 1,
+  "id": "domtest",
+  "packages": ["DOMParser"],
+  "allowEval": false,
+  "allowUrls": ["everywhere"]
+}
