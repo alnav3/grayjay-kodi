@@ -17,3 +17,29 @@ msgstr ""
 msgctxt "#30002"
 msgid "Search"
 msgstr ""
+
+# -- Settings: General --
+msgctxt "#30010"
+msgid "General"
+msgstr ""
+
+msgctxt "#30011"
+msgid "HTTP timeout (seconds)"
+msgstr ""
+
+msgctxt "#30012"
+msgid "Verify plugin signatures"
+msgstr ""
+
+# -- Settings: Updates --
+msgctxt "#30013"
+msgid "Updates"
+msgstr ""
+
+msgctxt "#30014"
+msgid "Auto-update sources in the background"
+msgstr ""
+
+msgctxt "#30015"
+msgid "Update check interval (hours)"
+msgstr ""

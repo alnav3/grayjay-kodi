@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <addon id="plugin.video.grayjay"
        name="Grayjay"
-       version="0.1.0"
+       version="0.2.0"
        provider-name="grayjay-kodi">
     <requires>
         <import addon="xbmc.python" version="3.0.0"/>
@@ -10,6 +10,7 @@
     <extension point="xbmc.python.pluginsource" library="default.py">
         <provides>video</provides>
     </extension>
+    <extension point="xbmc.service" library="service.py"/>
     <extension point="xbmc.addon.metadata">
         <summary lang="en_GB">Grayjay sources for Kodi</summary>
         <description lang="en_GB">Runs Grayjay JavaScript source plugins inside Kodi. Follow creators across platforms using the same community source plugins as the Grayjay app. Experimental.</description>

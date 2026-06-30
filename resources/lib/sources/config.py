@@ -35,6 +35,20 @@ class SourceConfig(object):
         return self.raw.get("scriptUrl", "")
 
     @property
+    def update_url(self):
+        """Canonical config URL to re-fetch this source from when checking for
+        updates. Grayjay publishes this as `sourceUrl`; fall back to the URL we
+        originally installed from (recorded in the host meta sidecar)."""
+        src = self.raw.get("sourceUrl")
+        if src:
+            return src
+        try:
+            from . import manager
+            return manager.read_meta(self.base_dir).get("install_url", "")
+        except Exception:
+            return ""
+
+    @property
     def script_path(self):
         """Local path to the downloaded plugin .js for this source."""
         return os.path.join(self.base_dir, "script.js")
