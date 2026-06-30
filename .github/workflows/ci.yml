@@ -1,0 +1,58 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+jobs:
+  compile:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Byte-compile addon code
+        # Our own code only — the vendored libs under engine/vendor* ship their
+        # own (sometimes py2-era) sources and aren't ours to lint.
+        run: |
+          python -m py_compile default.py service.py
+          find resources/lib -name '*.py' \
+            -not -path '*/vendor/*' \
+            -not -path '*/vendor_native/*' \
+            -print0 | xargs -0 python -m py_compile
+
+      - name: Validate XML
+        run: |
+          python - <<'PY'
+          import xml.dom.minidom as m
+          for f in ("addon.xml", "resources/settings.xml"):
+              m.parse(f)
+              print("OK", f)
+          PY
+
+      - name: Smoke-test pure-Python modules (no Kodi)
+        # kodiutils/router degrade gracefully when xbmc* is absent, so the
+        # source/group/update logic is importable and exercisable headless.
+        run: |
+          python - <<'PY'
+          import tempfile
+          import resources.lib.kodiutils as k
+          k.profile_path = lambda _sb=tempfile.mkdtemp(): _sb
+          from resources.lib.sources import groups, official
+          from resources.lib import router
+          # formatting helpers
+          assert router._human_count(1234567) == "1.2M"
+          assert "ago" in router._relative_time(0)
+          # official sources list is well-formed
+          assert len(official.OFFICIAL_SOURCES) >= 20
+          assert all(u.startswith("https://") for _, u in official.OFFICIAL_SOURCES)
+          # group CRUD round-trip
+          g = groups.create_group("Test")
+          groups.add_member(g["id"], "src", "https://x/c", "Chan")
+          assert groups.is_member(g["id"], "src", "https://x/c")
+          assert groups.delete_group(g["id"])
+          print("smoke OK")
+          PY
