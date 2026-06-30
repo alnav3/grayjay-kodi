@@ -139,14 +139,18 @@ class Router(object):
             return None
         desc = details.get("video") or {}
         sources = desc.get("videoSources") or []
-        # Prefer HLS/DASH adaptive, else highest-resolution progressive.
+        # source.js tags the class via `plugin_type` (Grayjay), older shims via
+        # `type`. Prefer adaptive HLS/DASH, then highest-res progressive.
+        def kind(s):
+            return s.get("plugin_type") or s.get("type") or ""
         for s in sources:
-            if s.get("type") in ("HLSSource", "DashSource"):
+            k = kind(s)
+            if "HLS" in k or "Dash" in k or "DASH" in k:
                 return s.get("url")
         best, best_h = None, -1
         for s in sources:
             h = s.get("height") or 0
-            if h > best_h:
+            if h >= best_h and s.get("url"):
                 best, best_h = s.get("url"), h
         return best
 

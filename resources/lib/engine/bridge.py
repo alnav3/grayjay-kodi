@@ -22,10 +22,13 @@ except ImportError:
     _requests = None
 
 import urllib.request as _urlreq
+import urllib.error  # noqa: F401  (exposes _urlreq.HTTPError reliably)
 
 
-PACKAGES_JS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "packages.js")
-DOM_JS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dom.js")
+_DIR = os.path.dirname(os.path.abspath(__file__))
+HOST_PRELUDE_JS = os.path.join(_DIR, "host_prelude.js")  # host-injected packages
+SOURCE_JS = os.path.join(_DIR, "source.js")              # Grayjay's own SDK prelude
+DOM_JS = os.path.join(_DIR, "dom.js")                    # domParser package
 
 
 class SignatureError(Exception):
@@ -59,25 +62,40 @@ class PluginBridge(object):
         if not self.config.url_allowed(url):
             return json.dumps({"url": url, "code": 0, "headers": {}, "body": "",
                                "error": "URL blocked by plugin allowUrls"})
+        # Ensure a browser-like UA unless the plugin set one (many sites 403 the
+        # default urllib/python agent).
+        if not any(k.lower() == "user-agent" for k in headers):
+            headers["User-Agent"] = self._default_ua()
         try:
             if _requests is not None:
                 resp = _requests.request(method, url, headers=headers,
-                                         data=body, timeout=20)
+                                         data=body, timeout=20, allow_redirects=True)
                 return json.dumps({
-                    "url": url, "code": resp.status_code,
+                    "url": resp.url, "code": resp.status_code,
                     "headers": dict(resp.headers), "body": resp.text,
                 })
             req = _urlreq.Request(url, method=method, headers=headers,
                                   data=body.encode("utf-8") if body else None)
-            with _urlreq.urlopen(req, timeout=20) as r:
+            try:
+                r = _urlreq.urlopen(req, timeout=20)
+            except _urlreq.HTTPError as he:
+                # Non-2xx: return the response rather than raising, so the
+                # plugin can inspect status/body (e.g. to detect captchas).
+                body_txt = he.read().decode("utf-8", "replace") if hasattr(he, "read") else ""
+                return json.dumps({"url": url, "code": he.code,
+                                   "headers": dict(he.headers or {}), "body": body_txt})
+            with r:
                 raw = r.read().decode("utf-8", "replace")
-                return json.dumps({
-                    "url": url, "code": r.status,
-                    "headers": dict(r.headers), "body": raw,
-                })
+                return json.dumps({"url": r.geturl(), "code": r.status,
+                                   "headers": dict(r.headers), "body": raw})
         except Exception as exc:
             log("http error %s: %s" % (url, exc), "warning")
             return json.dumps({"url": url, "code": 0, "headers": {}, "body": "", "error": str(exc)})
+
+    @staticmethod
+    def _default_ua():
+        return ("Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/124.0 Mobile Safari/537.36")
 
     def _host_b64encode(self, payload_json):
         data = json.loads(payload_json).get("data", "")
@@ -94,6 +112,23 @@ class PluginBridge(object):
         data = json.loads(payload_json).get("data", "")
         return json.dumps({"out": hashlib.md5(data.encode("utf-8")).hexdigest()})
 
+    def _host_toast(self, payload_json):
+        try:
+            from ..kodiutils import notify
+            notify(json.loads(payload_json).get("msg", ""))
+        except Exception:
+            pass
+        return None
+
+    def _host_sleep(self, payload_json):
+        import time
+        try:
+            ms = float(json.loads(payload_json).get("ms", 0))
+            time.sleep(min(max(ms, 0) / 1000.0, 10.0))  # cap at 10s
+        except Exception:
+            pass
+        return None
+
     def _register_host(self):
         e = self.engine
         e.register("__host_log", self._host_log)
@@ -104,6 +139,8 @@ class PluginBridge(object):
         e.register("__host_md5", self._host_md5)
         e.register("__host_dom_parse", self._dom.parse)
         e.register("__host_dom_op", self._dom.op)
+        e.register("__host_toast", self._host_toast)
+        e.register("__host_sleep", self._host_sleep)
 
     # -- lifecycle --------------------------------------------------------
     def load(self):
@@ -134,15 +171,24 @@ class PluginBridge(object):
             log("Plugin %s signature verified." % self.config.id, "info")
 
         self._register_host()
-        with open(PACKAGES_JS, "r", encoding="utf-8") as fh:
-            self.engine.eval(fh.read())
-        with open(DOM_JS, "r", encoding="utf-8") as fh:
-            self.engine.eval(fh.read())
-        # Expose the parsed config to the plugin as `plugin.config`.
-        self.engine.eval("var plugin = %s;" % json.dumps({
-            "config": self.config.raw,
-        }))
-        self.engine.eval(script)
+        # host_prelude/dom are IIFEs that attach to globalThis, so they can be
+        # eval'd independently. source.js + the plugin, however, use top-level
+        # let/const/class — those are lexically scoped to a single eval and are
+        # invisible across eval calls. Grayjay runs them as one compilation
+        # unit, so we concatenate source.js + config + plugin and expose the
+        # resulting `source`/`plugin`/`Type` onto globalThis for later calls.
+        for path in (HOST_PRELUDE_JS, DOM_JS):
+            with open(path, "r", encoding="utf-8") as fh:
+                self.engine.eval(fh.read())
+        with open(SOURCE_JS, "r", encoding="utf-8") as fh:
+            source_sdk = fh.read()
+        combined = "\n;\n".join([
+            source_sdk,
+            "plugin.config = %s; plugin.settings = plugin.settings || {};" % json.dumps(self.config.raw),
+            script,
+            "globalThis.source = source; globalThis.plugin = plugin; globalThis.Type = Type;",
+        ])
+        self.engine.eval(combined)
         self._loaded = True
 
     def enable(self, settings=None, saved_state=None):

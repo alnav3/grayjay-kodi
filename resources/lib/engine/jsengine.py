@@ -20,13 +20,61 @@ The native backends need a build matching Kodi's bundled Python ABI on the
 target arch; js2py sidesteps that entirely. See README.md.
 """
 import os
+import platform
 import sys
+import sysconfig
 
 # Allow a vendored copy of pure-Python deps (js2py + pyjsparser) to be shipped
 # inside the addon so no installation is needed on the target.
-_VENDOR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "vendor")
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_VENDOR = os.path.join(_HERE, "vendor")
 if os.path.isdir(_VENDOR) and _VENDOR not in sys.path:
     sys.path.insert(0, _VENDOR)
+
+
+def _native_vendor_dir():
+    """Locate a vendored native engine build matching this interpreter.
+
+    Native extensions (e.g. quickjs) are arch + Python-version + ABI specific.
+    The CoreELEC target is 32-bit ARM (armv7l) on CPython 3.11, even though the
+    kernel reports aarch64 — so we key on the actual userspace machine and the
+    Python tag, not on uname. Falls back to the pure-Python js2py backend when
+    no matching build is present (e.g. on a dev machine).
+    """
+    machine = platform.machine()  # e.g. 'armv7l'
+    pyver = "cp%d%d" % sys.version_info[:2]
+    candidates = [
+        "%s-%s" % (machine, pyver),                      # armv7l-cp311
+        "%s-%s" % (sysconfig.get_platform(), pyver),     # linux-armv7l-cp311 variants
+    ]
+    root = os.path.join(_HERE, "vendor_native")
+    for c in candidates:
+        d = os.path.join(root, c)
+        if os.path.isdir(d):
+            return d
+    return None
+
+
+_NATIVE = _native_vendor_dir()
+if _NATIVE and _NATIVE not in sys.path:
+    sys.path.insert(0, _NATIVE)
+
+
+def _preload_libatomic():
+    """The armv7l quickjs build references 64-bit atomic intrinsics that 32-bit
+    ARM provides via libatomic. CPython doesn't link it, so the extension fails
+    with `undefined symbol: __atomic_*`. Load it RTLD_GLOBAL first so those
+    symbols resolve. No-op (and harmless) where libatomic is absent/unneeded."""
+    if not _NATIVE:
+        return
+    try:
+        import ctypes
+        ctypes.CDLL("libatomic.so.1", mode=ctypes.RTLD_GLOBAL)
+    except OSError:
+        pass
+
+
+_preload_libatomic()
 
 from ..kodiutils import log
 

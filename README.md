@@ -39,18 +39,26 @@ tools/harness.py               run a plugin off-Kodi for testing
 4. `router` turns results into `ListItem`s; `getContentDetails` yields a stream
    URL for `setResolvedUrl`.
 
-## The hard dependency: a JS engine in Kodi's Python
+## The JS engine (solved for the CoreELEC target)
 
-This is the make-or-break piece. Kodi runs its own bundled CPython, so you need
-a JS engine importable from it:
+Kodi runs its own bundled CPython, so we need a JS engine importable from it.
+Backends, in preference order (`jsengine.py`, override via `GRAYJAY_JS_BACKEND`):
 
-- **`quickjs`** (preferred) — supports host callbacks, so HTTP works
-  synchronously. Needs a build matching Kodi's Python ABI and your CPU arch
-  (the CoreELEC test box is **aarch64**).
-- **`py_mini_racer`** (fallback) — V8, but eval-only: no host callbacks, so
-  HTTP-driven plugins won't work without a redesign.
+- **`quickjs`** (used on the box) — Bellard's QuickJS. Supports **ES2020**
+  (`?.`/`??`) *and* host callbacks (so HTTP/DOM bridges work synchronously).
+- **`py_mini_racer`** — V8, eval-only (no host callbacks); not used.
+- **`js2py`** (pure-Python fallback) — vendored; runs ES5 only, so it handles
+  the bundled test sources but **not** real modern plugins.
 
-Getting a working `quickjs` wheel onto the target is the main open task.
+### Key target fact: the box is 32-bit ARM
+
+The CoreELEC box reports `aarch64` from `uname` (64-bit kernel) but ships a
+**32-bit `armv7l` userspace** — `python3` is a 32-bit ELF. So aarch64 wheels
+never load. The working engine is the **`quickjs` `cp311` `armv7l` wheel from
+piwheels** (Raspberry Pi's repo), vendored under
+`resources/lib/engine/vendor_native/armv7l-cp311/`. It needs `libatomic`
+(32-bit ARM lacks native 64-bit atomics); `jsengine.py` `ctypes`-preloads
+`libatomic.so.1` before importing. No compiler/pip needed on the box.
 
 ## Status / TODO
 
@@ -65,22 +73,27 @@ Getting a working `quickjs` wheel onto the target is the main open task.
       (querySelector, getElementsBy*, attributes, ...), faithful to Grayjay's
       jsoup API. Validated on the CoreELEC box.
 - [x] Installed + registered live in Kodi 21.3 on the target box
-- [ ] **Real JS engine — the blocker.** js2py cannot parse ES2020. The official
-      YouTube plugin uses `?.` (704×) and `??` (204×) and fails to load under
-      js2py. Need quickjs/V8 built for Kodi-Python/aarch64, or a transpile step.
+- [x] **Real JS engine working on the box** — quickjs (armv7l) with ES2020 +
+      host callbacks (see above).
+- [x] **Uses Grayjay's own `source.js` SDK prelude** (models, exceptions,
+      pagers, `Type`, `URLSearchParams`) verbatim + host-injected packages
+      (`http`, `utility`, `bridge`, `domParser`) and a `URL` polyfill.
+- [x] **Runs real signed community plugins.** PeerTube: `getHome` → 20 real
+      videos; `getContentDetails` → real HLS stream URL, end to end on the box.
+- [ ] Per-plugin gaps: YouTube bundles a minified JSDOM whose regex quickjs
+      rejects (stricter Annex-B than V8) — parse-time fail; Rumble is bot-blocked
+      (307); Odysee hits a missing host function. Lighter API plugins work best.
 - [ ] Pager `nextPage()` continuation across Kodi page loads
 - [ ] Settings persistence per source, auth/login flows
 - [ ] Comments, channels, playlists, search capabilities UI
 
-### Engine reality check (tested on the box)
+### What runs today (verified on the CoreELEC box)
 
-Everything in the *host* works on the CoreELEC box under vendored js2py:
-signature verification (incl. catching a CRLF round-trip bug), DOMParser, the
-HTTP bridge, models and pagers. The remaining gap is purely the JS engine:
-**js2py's parser predates ES2020**, so modern real-world plugins won't even
-parse. The example/net/dom test sources (ES5) run fine; the YouTube plugin does
-not. Shipping a real engine is the one thing standing between this and running
-actual community sources.
+Under quickjs: signature verification (matches FUTO vectors + real plugins;
+caught a CRLF bug), DOMParser, HTTP bridge, the full Grayjay `source.js` SDK,
+and **real plugins end-to-end** — PeerTube returns real videos and a playable
+HLS URL. Engine differences vs Grayjay's V8 remain per-plugin (e.g. YouTube's
+bundled JSDOM regex; sites with bot protection).
 
 ## Security
 
