@@ -51,14 +51,14 @@ class Router(object):
             cache = self._bridges = {}
         if source_id in cache:
             return cache[source_id]
-        from .sources import manager
+        from .sources import manager, plugin_settings
         from .engine.bridge import PluginBridge
         cfg = manager.get_source(source_id)
         if cfg is None:
             cache[source_id] = None
             return None
         bridge = PluginBridge(cfg)
-        bridge.enable()
+        bridge.enable(settings=plugin_settings.load(cfg))
         cache[source_id] = bridge
         return bridge
 
@@ -85,14 +85,38 @@ class Router(object):
         items.append((self.url_for(action="subscriptions"),
                       "[ Subscriptions ]", True, ""))
         for cfg in manager.list_sources():
+            ctx = [
+                ("Settings",
+                 "RunPlugin(%s)" % self.url_for(action="source_settings", source=cfg.id)),
+                ("Update %s" % cfg.name,
+                 "RunPlugin(%s)" % self.url_for(action="update_source", source=cfg.id)),
+            ]
             items.append((
                 self.url_for(action="home", source=cfg.id),
-                cfg.name, True, cfg.icon_url,
+                cfg.name, True, cfg.icon_url, None, ctx,
             ))
-        items.append((self.url_for(action="add_source"), "[ Add source… ]", False, ""))
+        items.append((self.url_for(action="add_source"), "[ Add source… ]", True, ""))
+        items.append((self.url_for(action="update_sources"), "[ Check for updates… ]", False, ""))
         self._render(items)
 
     def action_add_source(self):
+        """Submenu: enter a config URL by hand, or pick an official source."""
+        from .sources import official, manager
+        installed = {c.id for c in manager.list_sources()}
+        installed_names = {c.name for c in manager.list_sources()}
+        items = [(self.url_for(action="add_source_url"), "[ Enter source URL… ]", False, "")]
+        for name, url in official.OFFICIAL_SOURCES:
+            label = name
+            # Best-effort "installed" hint (we don't fetch each config here).
+            if name in installed_names or name.split(" (")[0] in installed:
+                label = "%s  ✓" % name
+            items.append((
+                self.url_for(action="install_official", url=url, name=name),
+                label, False, "",
+            ))
+        self._render(items)
+
+    def action_add_source_url(self):
         if not _HAS_KODI:
             return
         url = xbmcgui.Dialog().input("Source config URL")
@@ -103,11 +127,134 @@ class Router(object):
             manager.install_from_url(url)
         except Exception as exc:
             notify("Install failed: %s" % exc)
-        xbmc.executebuiltin("Container.Refresh")
+        # Return to the root list after adding.
+        if _HAS_KODI:
+            xbmc.executebuiltin("Container.Update(%s,replace)" % self.url_for(action="root"))
+
+    def action_install_official(self):
+        """Install one of Grayjay's official sources by its config URL."""
+        url = self.args.get("url")
+        name = self.args.get("name", "source")
+        if not url:
+            return
+        if _HAS_KODI:
+            notify("Installing %s…" % name)
+        from .sources import manager
+        try:
+            manager.install_from_url(url)
+        except Exception as exc:
+            notify("Install failed: %s" % exc)
+        if _HAS_KODI:
+            xbmc.executebuiltin("Container.Update(%s,replace)" % self.url_for(action="root"))
+
+    def action_update_sources(self):
+        """Manually check all sources and apply any available updates."""
+        from .sources import updates
+        if _HAS_KODI:
+            notify("Checking for source updates…")
+        applied, checked = updates.update_all(notify_summary=False)
+        errors = [c for c in checked if c.get("error")]
+        if applied:
+            notify("Updated %d source(s)" % len(applied))
+        elif errors:
+            notify("Update check: %d error(s)" % len(errors))
+        else:
+            notify("All %d source(s) up to date" % len(checked))
+        if _HAS_KODI:
+            xbmc.executebuiltin("Container.Refresh")
+
+    def action_update_source(self):
+        """Update a single source by id (from its context menu)."""
+        from .sources import manager, updates
+        source_id = self.args.get("source")
+        cfg = manager.get_source(source_id)
+        if cfg is None:
+            notify("Source not found")
+            return
+        applied, info = updates.update_source(cfg)
+        if applied:
+            notify("Updated %s to v%s" % (cfg.name, info.get("applied_version")))
+        elif info.get("error"):
+            notify("Update failed: %s" % info["error"])
+        else:
+            notify("%s is up to date" % cfg.name)
+        if _HAS_KODI:
+            xbmc.executebuiltin("Container.Refresh")
+
+    # -- per-source plugin settings ---------------------------------------
+    def action_source_settings(self):
+        """Edit a source's own plugin settings (e.g. YouTube's 'Allow Age
+        Restricted'). These are declared by the plugin in its config and read in
+        source.enable(); we persist overrides per source and pass them in on
+        every call."""
+        if not _HAS_KODI:
+            return
+        from .sources import manager, plugin_settings
+        source_id = self.args.get("source")
+        cfg = manager.get_source(source_id)
+        if cfg is None:
+            notify("Source not found")
+            return
+        descs = [d for d in plugin_settings.descriptors(cfg) if d.get("variable")
+                 and (d.get("type") or "").lower() in ("boolean", "dropdown")]
+        if not descs:
+            notify("%s has no editable settings" % cfg.name)
+            return
+        values = plugin_settings.load(cfg)
+        dialog = xbmcgui.Dialog()
+        while True:
+            labels = [self._setting_label(d, values) for d in descs]
+            labels.append("[ Save & close ]")
+            idx = dialog.select("%s settings" % cfg.name, labels)
+            if idx < 0 or idx == len(descs):       # cancel or "Save & close"
+                break
+            d = descs[idx]
+            var = d["variable"]
+            t = (d.get("type") or "").lower()
+            if t == "boolean":
+                values[var] = not bool(values.get(var))
+            elif t == "dropdown":
+                opts = d.get("options") or []
+                cur = int(values.get(var) or 0)
+                pick = dialog.select(d.get("name", var), opts, preselect=cur)
+                if pick >= 0:
+                    values[var] = pick
+        plugin_settings.save(cfg, values)
+        notify("Saved %s settings" % cfg.name)
+
+    @staticmethod
+    def _setting_label(desc, values):
+        var = desc["variable"]
+        name = desc.get("name", var)
+        t = (desc.get("type") or "").lower()
+        val = values.get(var)
+        if t == "boolean":
+            return "%s: %s" % (name, "ON" if val else "off")
+        if t == "dropdown":
+            opts = desc.get("options") or []
+            try:
+                shown = opts[int(val or 0)]
+            except (IndexError, ValueError, TypeError):
+                shown = str(val)
+            return "%s: %s" % (name, shown)
+        return "%s: %s" % (name, val)
 
     # -- per-source feeds -------------------------------------------------
     def action_home(self):
-        self._feed("getHome")
+        """A source's landing page: actions (Search) followed by its home feed,
+        the same shape as opening a source in the Grayjay app."""
+        from .sources import manager
+        source_id = self.args.get("source")
+        cfg = manager.get_source(source_id)
+        name = cfg.name if cfg else source_id
+        items = [
+            (self.url_for(action="search", source=source_id),
+             "[ Search %s ]" % name, True, ""),
+        ]
+        page = self.args.get("page") or None
+        results = self._run(source_id, "getHome", [page])
+        items += [self._content_item(source_id, v) for v in results]
+        self._render(items, content_type="videos")
 
     def action_search(self):
         if not _HAS_KODI:
@@ -142,7 +289,7 @@ class Router(object):
                 collected.append((s["source"], v))
         # Newest first when items carry a datetime (unix seconds).
         collected.sort(key=lambda sv: (sv[1].get("datetime") or 0), reverse=True)
-        items = [self._content_item(src, v) for src, v in collected]
+        items = [self._content_item(src, v, show_source=True) for src, v in collected]
         self._render(items, content_type="videos")
 
     def action_subscribe(self):
@@ -185,14 +332,62 @@ class Router(object):
             items.append(self._content_item(source_id, v))
         self._render(items, content_type="videos")
 
-    def _content_item(self, source_id, v):
+    def _source_name(self, source_id):
+        """Display name for a source id, cached for the request."""
+        cache = getattr(self, "_src_names", None)
+        if cache is None:
+            from .sources import manager
+            cache = self._src_names = {c.id: c.name for c in manager.list_sources()}
+        return cache.get(source_id, source_id)
+
+    def _content_item(self, source_id, v, show_source=False):
         title = v.get("name", "Untitled")
         url = self.url_for(action="play", source=source_id, url=v.get("url", ""))
         thumb = ""
         thumbs = (v.get("thumbnails") or {}).get("sources") or []
         if thumbs:
             thumb = thumbs[-1].get("url", "")
-        return (url, title, False, thumb, v, self._context_menu(source_id, v))
+        info = self._video_info(source_id, v, show_source)
+        return (url, title, False, thumb, info, self._context_menu(source_id, v))
+
+    def _video_info(self, source_id, v, show_source):
+        """Grayjay-style metadata for a video item: the
+        '<source> • <channel> • <views> views • <relative time>' line, plus the
+        infolabels (date, duration, plot) that Kodi skins surface."""
+        author = (v.get("author") or {}).get("name", "")
+        views = v.get("viewCount") or 0
+        dt = v.get("datetime") or 0
+        dur = v.get("duration") or 0
+        is_live = bool(v.get("isLive"))
+        src = self._source_name(source_id)
+
+        parts = []
+        if show_source and src:
+            parts.append(src)
+        if author:
+            parts.append(author)
+        if is_live:
+            parts.append("LIVE")
+        elif views and views > 0:
+            parts.append("%s views" % _human_count(views))
+        if dt:
+            parts.append(_relative_time(dt))
+        metaline = "  •  ".join(parts)
+
+        desc = v.get("description") or ""
+        plot = "%s\n\n%s" % (metaline, desc) if (metaline and desc) else (desc or metaline)
+
+        return {
+            "mediatype": "video",
+            "label2": metaline,
+            "plot": plot,
+            "duration": int(dur) if dur else 0,
+            "studio": src,
+            "author": author,
+            "premiered": _fmt_date(dt) if dt else "",
+            "dateadded": _fmt_datetime(dt) if dt else "",
+            "live": is_live,
+        }
 
     def _context_menu(self, source_id, v):
         """Right-click menu: Subscribe to / Unsubscribe from this video's
@@ -215,7 +410,7 @@ class Router(object):
         return menu
 
     def action_play(self):
-        from .sources import manager
+        from .sources import manager, plugin_settings
         from .engine.bridge import PluginBridge
 
         source_id = self.args.get("source")
@@ -225,7 +420,7 @@ class Router(object):
             notify("Source not found")
             return
         bridge = PluginBridge(cfg)
-        bridge.enable()
+        bridge.enable(settings=plugin_settings.load(cfg))
         details = bridge.call("getContentDetails", [content_url])
         play_url = self._pick_stream(details)
         if not play_url:

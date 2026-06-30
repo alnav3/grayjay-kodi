@@ -25,6 +25,31 @@ import urllib.request as _urlreq
 import urllib.error  # noqa: F401  (exposes _urlreq.HTTPError reliably)
 
 
+def _resolve_ca_bundle():
+    """Pick a CA bundle that can actually build trust chains on this box.
+
+    Kodi ships `script.module.certifi`, and `requests` uses it by default — but
+    that bundle lags the OS trust store and fails to verify hosts whose root CA
+    is newer than the bundle (e.g. ted.com → 'unable to get local issuer
+    certificate'). The CoreELEC/OS store is kept current, so prefer it. Honor
+    the standard env overrides first; fall back to requests' own default (True)
+    when nothing concrete is found."""
+    for env in ("SSL_CERT_FILE", "REQUESTS_CA_BUNDLE"):
+        p = os.environ.get(env)
+        if p and os.path.isfile(p):
+            return p
+    for p in ("/etc/ssl/cert.pem",                       # CoreELEC / *BSD / macOS
+              "/etc/ssl/certs/ca-certificates.crt",      # Debian/Ubuntu
+              "/etc/pki/tls/certs/ca-bundle.crt"):       # Fedora/RHEL
+        if os.path.isfile(p):
+            return p
+    return True  # let requests use its bundled certifi default
+
+
+# Resolved once: a filesystem path to a CA bundle, or True (requests default).
+_CA_BUNDLE = _resolve_ca_bundle()
+
+
 _DIR = os.path.dirname(os.path.abspath(__file__))
 HOST_PRELUDE_JS = os.path.join(_DIR, "host_prelude.js")  # host-injected packages
 SOURCE_JS = os.path.join(_DIR, "source.js")              # Grayjay's own SDK prelude
@@ -40,6 +65,7 @@ class PluginBridge(object):
         self.config = config           # sources.config.SourceConfig
         self.engine = JSEngine()
         self._loaded = False
+        self.settings = {}             # per-source plugin settings (by variable)
         from .dom import DOMRegistry
         self._dom = DOMRegistry()
 
@@ -69,7 +95,8 @@ class PluginBridge(object):
         try:
             if _requests is not None:
                 resp = _requests.request(method, url, headers=headers,
-                                         data=body, timeout=20, allow_redirects=True)
+                                         data=body, timeout=20, allow_redirects=True,
+                                         verify=_CA_BUNDLE)
                 return json.dumps({
                     "url": resp.url, "code": resp.status_code,
                     "headers": dict(resp.headers), "body": resp.text,
@@ -187,7 +214,8 @@ class PluginBridge(object):
         # bytes; this only adapts the code for our JS engine.
         combined = "\n;\n".join([
             self.engine.prepare(source_sdk),
-            "plugin.config = %s; plugin.settings = plugin.settings || {};" % json.dumps(self.config.raw),
+            "plugin.config = %s; plugin.settings = %s;" % (
+                json.dumps(self.config.raw), json.dumps(self.settings)),
             self.engine.prepare(script),
             "globalThis.source = source; globalThis.plugin = plugin; globalThis.Type = Type;",
         ])
@@ -195,9 +223,13 @@ class PluginBridge(object):
         self._loaded = True
 
     def enable(self, settings=None, saved_state=None):
+        # Stash settings before load() so they're injected as plugin.settings
+        # in the same eval as the SDK + plugin.
+        if settings is not None:
+            self.settings = settings
         self.load()
         conf = json.dumps(self.config.raw)
-        s = json.dumps(settings or {})
+        s = json.dumps(self.settings or {})
         st = json.dumps(saved_state or "")
         self.engine.eval(
             "if (source.enable) source.enable(%s, %s, %s);" % (conf, s, st)
