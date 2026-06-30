@@ -692,9 +692,27 @@ class Router(object):
                 log("would play: %s" % play_url, "info")
             return
 
-        # Fallback A: a muxed (progressive) stream — a single URL Kodi's native
-        # player handles directly, no inputstream.adaptive needed. Reliable but
-        # capped at the qualities YouTube still muxes (usually 360p, itag 18).
+        # Preferred fallback: full-quality adaptive (video-only + audio-only)
+        # tracks combined into a DASH manifest for inputstream.adaptive. ISA
+        # only loads a manifest over HTTP, so this needs the background service's
+        # manifest server to be up.
+        mpd_path = self._build_dash(cfg, bridge, details)
+        manifest_url = self._manifest_url(mpd_path)
+        if manifest_url:
+            if _HAS_KODI:
+                li = xbmcgui.ListItem(path=manifest_url)
+                li.setMimeType("application/dash+xml")
+                li.setContentLookup(False)
+                li.setProperty("inputstream", "inputstream.adaptive")
+                xbmcplugin.setResolvedUrl(self.handle, True, li)
+            else:
+                log("would play DASH manifest: %s" % manifest_url, "info")
+            return
+
+        # Fallback: a muxed (progressive) stream — a single URL Kodi's native
+        # player handles directly, no ISA needed. Reliable but capped at the
+        # qualities YouTube still muxes (usually 360p, itag 18). Used when the
+        # manifest server isn't available or there are no adaptive tracks.
         muxed_url = self._pick_muxed(bridge)
         if muxed_url:
             if _HAS_KODI:
@@ -705,27 +723,27 @@ class Router(object):
                 log("would play muxed: %s" % muxed_url, "info")
             return
 
-        # Fallback B: adaptive video-only + audio-only tracks (YouTube). Build a
-        # DASH manifest from the direct-URL formats harvested off the player
-        # response and let inputstream.adaptive mux them.
-        mpd_path = self._build_dash(cfg, bridge, details)
-        if mpd_path:
-            # inputstream.adaptive fetches the manifest through its own (CURL)
-            # downloader, which needs a URL *scheme* — a bare /storage/… path
-            # fails with "Download failed, internal error". Hand it a file:// URL.
-            manifest_url = "file://" + mpd_path
-            if _HAS_KODI:
-                li = xbmcgui.ListItem(path=manifest_url)
-                li.setMimeType("application/dash+xml")
-                li.setContentLookup(False)
-                li.setProperty("inputstream", "inputstream.adaptive")
-                li.setProperty("inputstream.adaptive.manifest_type", "mpd")
-                xbmcplugin.setResolvedUrl(self.handle, True, li)
-            else:
-                log("would play DASH manifest: %s" % manifest_url, "info")
-            return
-
         notify("No playable stream found")
+
+    def _manifest_url(self, mpd_path):
+        """If a DASH manifest was built and the loopback manifest server is
+        alive, return the http:// URL ISA should fetch; else None (caller falls
+        back to a muxed stream)."""
+        if not mpd_path:
+            return None
+        import os
+        import socket
+        from .playback import manifest_server
+        from .kodiutils import profile_path
+        port = manifest_server.published_port(profile_path())
+        if not port:
+            return None
+        try:
+            sock = socket.create_connection(("127.0.0.1", port), timeout=1)
+            sock.close()
+        except OSError:
+            return None
+        return "http://127.0.0.1:%d/%s" % (port, os.path.basename(mpd_path))
 
     def _pick_muxed(self, bridge):
         """Highest-resolution muxed/progressive URL harvested from the player
