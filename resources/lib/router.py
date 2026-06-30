@@ -42,11 +42,48 @@ class Router(object):
             if _HAS_KODI and self.handle >= 0:
                 xbmcplugin.endOfDirectory(self.handle, succeeded=False)
 
+    # -- bridge reuse -----------------------------------------------------
+    def _bridge(self, source_id):
+        """Return an enabled PluginBridge for a source, cached per request so
+        aggregating many channels from one source only parses its JS once."""
+        cache = getattr(self, "_bridges", None)
+        if cache is None:
+            cache = self._bridges = {}
+        if source_id in cache:
+            return cache[source_id]
+        from .sources import manager
+        from .engine.bridge import PluginBridge
+        cfg = manager.get_source(source_id)
+        if cfg is None:
+            cache[source_id] = None
+            return None
+        bridge = PluginBridge(cfg)
+        bridge.enable()
+        cache[source_id] = bridge
+        return bridge
+
+    def _run(self, source_id, method, args):
+        """Call a source method, returning a flat results list ([] on error)."""
+        bridge = self._bridge(source_id)
+        if bridge is None:
+            return []
+        try:
+            result = bridge.call(method, args)
+        except Exception as exc:
+            log("%s.%s failed: %s" % (source_id, method, exc), "warning")
+            return []
+        if isinstance(result, dict):
+            return result.get("results", [])
+        return result or []
+
     # -- top level --------------------------------------------------------
     def action_root(self):
-        """List installed sources + management entries."""
+        """List Subscriptions, installed sources, and management entries."""
         from .sources import manager
         items = []
+        # Subscriptions first — the cross-platform feed of channels you follow.
+        items.append((self.url_for(action="subscriptions"),
+                      "[ Subscriptions ]", True, ""))
         for cfg in manager.list_sources():
             items.append((
                 self.url_for(action="home", source=cfg.id),
@@ -81,24 +118,70 @@ class Router(object):
         self._feed("search", extra_args=[query, None, None, []])
 
     def _feed(self, method, extra_args=None):
-        from .sources import manager
-        from .engine.bridge import PluginBridge
-
         source_id = self.args.get("source")
         page = self.args.get("page") or None
-        cfg = manager.get_source(source_id)
-        if cfg is None:
-            notify("Source not found: %s" % source_id)
+        results = self._run(source_id, method, (extra_args or []) + [page])
+        items = [self._content_item(source_id, v) for v in results]
+        self._render(items, content_type="videos")
+
+    # -- subscriptions (cross-platform) -----------------------------------
+    def action_subscriptions(self):
+        """Aggregate recent content from every subscribed channel, across all
+        sources, newest first. This is the Grayjay-style unified feed."""
+        from .sources import subscriptions as subs
+        all_subs = subs.list_subscriptions()
+        if not all_subs:
+            self._render([(self.url_for(action="root"),
+                           "No subscriptions yet — use 'Subscribe' on any video", False, "")])
             return
+        collected = []
+        for s in all_subs:
+            results = self._run(s["source"], "getChannelContents",
+                                [s["url"], None, None, [], None])
+            for v in results:
+                collected.append((s["source"], v))
+        # Newest first when items carry a datetime (unix seconds).
+        collected.sort(key=lambda sv: (sv[1].get("datetime") or 0), reverse=True)
+        items = [self._content_item(src, v) for src, v in collected]
+        self._render(items, content_type="videos")
 
-        bridge = PluginBridge(cfg)
-        bridge.enable()
-        call_args = (extra_args or []) + [page]
-        result = bridge.call(method, call_args)
-        results = (result or {}).get("results", []) if isinstance(result, dict) else (result or [])
+    def action_subscribe(self):
+        from .sources import subscriptions as subs
+        source_id = self.args.get("source")
+        url = self.args.get("url")
+        name = self.args.get("name", "")
+        if not source_id or not url:
+            return
+        if subs.add_subscription(source_id, url, name):
+            notify("Subscribed to %s" % (name or url))
+        else:
+            notify("Already subscribed")
+        if _HAS_KODI:
+            xbmc.executebuiltin("Container.Refresh")
 
+    def action_unsubscribe(self):
+        from .sources import subscriptions as subs
+        source_id = self.args.get("source")
+        url = self.args.get("url")
+        if subs.remove_subscription(source_id, url):
+            notify("Unsubscribed")
+        if _HAS_KODI:
+            xbmc.executebuiltin("Container.Refresh")
+
+    def action_channel(self):
+        """Browse a channel's contents, with a subscribe/unsubscribe entry."""
+        from .sources import subscriptions as subs
+        source_id = self.args.get("source")
+        url = self.args.get("url")
+        name = self.args.get("name", "")
         items = []
-        for v in results:
+        if subs.is_subscribed(source_id, url):
+            items.append((self.url_for(action="unsubscribe", source=source_id, url=url),
+                          "[ Unsubscribe ]", False, ""))
+        else:
+            items.append((self.url_for(action="subscribe", source=source_id, url=url, name=name),
+                          "[ Subscribe ]", False, ""))
+        for v in self._run(source_id, "getChannelContents", [url, None, None, [], None]):
             items.append(self._content_item(source_id, v))
         self._render(items, content_type="videos")
 
@@ -109,7 +192,27 @@ class Router(object):
         thumbs = (v.get("thumbnails") or {}).get("sources") or []
         if thumbs:
             thumb = thumbs[-1].get("url", "")
-        return (url, title, False, thumb, v)
+        return (url, title, False, thumb, v, self._context_menu(source_id, v))
+
+    def _context_menu(self, source_id, v):
+        """Right-click menu: Subscribe to / Unsubscribe from this video's
+        channel (a local, cross-platform subscription via this addon)."""
+        author = v.get("author") or {}
+        ch_url = author.get("url")
+        ch_name = author.get("name", "")
+        if not ch_url:
+            return []
+        from .sources import subscriptions as subs
+        menu = []
+        if subs.is_subscribed(source_id, ch_url):
+            menu.append(("Unsubscribe from %s" % ch_name,
+                         "RunPlugin(%s)" % self.url_for(action="unsubscribe", source=source_id, url=ch_url)))
+        else:
+            menu.append(("Subscribe to %s" % ch_name,
+                         "RunPlugin(%s)" % self.url_for(action="subscribe", source=source_id, url=ch_url, name=ch_name)))
+        menu.append(("Go to channel",
+                     "Container.Update(%s)" % self.url_for(action="channel", source=source_id, url=ch_url, name=ch_name)))
+        return menu
 
     def action_play(self):
         from .sources import manager
@@ -165,10 +268,13 @@ class Router(object):
         for it in items:
             url, label, is_folder = it[0], it[1], it[2]
             thumb = it[3] if len(it) > 3 else ""
+            context = it[5] if len(it) > 5 else None
             li = xbmcgui.ListItem(label=label)
             if thumb:
                 li.setArt({"thumb": thumb, "icon": thumb})
             if not is_folder:
                 li.setProperty("IsPlayable", "true")
+            if context:
+                li.addContextMenuItems(context)
             xbmcplugin.addDirectoryItem(self.handle, url, li, is_folder)
         xbmcplugin.endOfDirectory(self.handle)

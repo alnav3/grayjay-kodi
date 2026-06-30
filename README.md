@@ -83,9 +83,13 @@ piwheels** (Raspberry Pi's repo), vendored under
 - [ ] Per-plugin gaps: YouTube bundles a minified JSDOM whose regex quickjs
       rejects (stricter Annex-B than V8) — parse-time fail; Rumble is bot-blocked
       (307); Odysee hits a missing host function. Lighter API plugins work best.
+- [x] **Cross-platform subscriptions** — subscribe to a channel *via this addon*
+      (not the upstream platform); the "Subscriptions" feed aggregates newest
+      content from all followed channels across every installed source. Right-
+      click any video → Subscribe / Go to channel.
 - [ ] Pager `nextPage()` continuation across Kodi page loads
 - [ ] Settings persistence per source, auth/login flows
-- [ ] Comments, channels, playlists, search capabilities UI
+- [ ] Channels, playlists, search capabilities UI
 
 ### What runs today (verified on the CoreELEC box)
 
