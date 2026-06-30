@@ -182,10 +182,13 @@ class PluginBridge(object):
                 self.engine.eval(fh.read())
         with open(SOURCE_JS, "r", encoding="utf-8") as fh:
             source_sdk = fh.read()
+        # Apply engine-specific fixups (e.g. quickjs \- in /u classes) to the
+        # SDK and plugin code. Signature was verified above on the original
+        # bytes; this only adapts the code for our JS engine.
         combined = "\n;\n".join([
-            source_sdk,
+            self.engine.prepare(source_sdk),
             "plugin.config = %s; plugin.settings = plugin.settings || {};" % json.dumps(self.config.raw),
-            script,
+            self.engine.prepare(script),
             "globalThis.source = source; globalThis.plugin = plugin; globalThis.Type = Type;",
         ])
         self.engine.eval(combined)

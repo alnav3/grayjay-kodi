@@ -79,6 +79,20 @@ _preload_libatomic()
 from ..kodiutils import log
 
 
+import re
+
+# Matches a run of backslashes followed by '-'. If the run length is odd, the
+# trailing backslash escapes the hyphen (\-) and is rewritten to \x2d.
+_DASH_ESCAPE_RE = re.compile(r"(\\+)-")
+
+
+def _dash_repl(m):
+    bs = m.group(1)
+    if len(bs) % 2 == 1:
+        return bs[:-1] + r"\x2d"
+    return m.group(0)
+
+
 class JSError(Exception):
     pass
 
@@ -231,3 +245,16 @@ class JSEngine(object):
         if self.backend == "js2py":
             return self._j2p_call(fn_name, *json_args)
         return self._mr_call(fn_name, *json_args)
+
+    def prepare(self, code):
+        """Apply backend-specific source fixups before eval.
+
+        quickjs 1.19.4 rejects an escaped hyphen (\\-) inside a /u (unicode)
+        character class, which V8 accepts — so real plugins (e.g. YouTube's
+        bundled JSDOM) fail to parse. Rewrite genuine \\- escapes to \\x2d
+        (the same literal hyphen in both strings and regexes), leaving escaped
+        backslashes (\\\\-) intact. Semantically neutral; only run for quickjs.
+        """
+        if self.backend != "quickjs":
+            return code
+        return _DASH_ESCAPE_RE.sub(_dash_repl, code)

@@ -21,7 +21,38 @@
   global.log = function (msg) {
     try { hostCall("__host_log", { msg: typeof msg === "string" ? msg : JSON.stringify(msg) }); } catch (e) {}
   };
-  global.console = { log: global.log, warn: global.log, error: global.log, info: global.log, debug: global.log };
+  var _noop = function () {};
+  global.console = {
+    log: global.log, warn: global.log, error: global.log, info: global.log, debug: global.log,
+    trace: global.log, dir: global.log, clear: _noop, group: _noop, groupEnd: _noop,
+    groupCollapsed: _noop, table: _noop, assert: _noop, count: _noop, countReset: _noop,
+    time: _noop, timeEnd: _noop, timeLog: _noop,
+  };
+
+  // ---- timers ------------------------------------------------------------
+  // Grayjay's V8 host provides global timers; quickjs does not, and plugins
+  // assert setTimeout exists. There is no event loop here, and Grayjay source
+  // methods are synchronous, so deferred callbacks (mostly JSDOM event/abort
+  // plumbing) are not awaited on the scraping path — accept and drop them.
+  var _timerId = 1;
+  global.setTimeout = function (fn, delay) { return _timerId++; };
+  global.clearTimeout = function (id) {};
+  global.setInterval = function (fn, delay) { return _timerId++; };
+  global.clearInterval = function (id) {};
+  global.queueMicrotask = function (fn) { try { fn(); } catch (e) {} };
+
+  // ---- missing engine globals (quickjs lacks these; JSDOM needs them) -----
+  if (typeof global.FinalizationRegistry === "undefined") {
+    // GC finalizers: we never run them — harmless for short-lived scrapes.
+    global.FinalizationRegistry = function (cb) {
+      this.register = function () {}; this.unregister = function () {};
+    };
+  }
+  if (typeof global.WeakRef === "undefined") {
+    // Hold a strong reference; deref always returns the value.
+    global.WeakRef = function (v) { this._v = v; };
+    global.WeakRef.prototype.deref = function () { return this._v; };
+  }
 
   // ---- HTTP package ------------------------------------------------------
   function HttpResponse(o) {
@@ -57,13 +88,15 @@
     fromBase64: function (s) { return hostCall("__host_b64decode", { data: s }).out; },
     randomUUID: function () { return hostCall("__host_uuid", {}).out; },
     md5: function (s) { return hostCall("__host_md5", { data: s }).out; },
+    md5String: function (s) { return hostCall("__host_md5", { data: s }).out; },
   };
 
   // ---- bridge package (Grayjay PackageBridge) ----------------------------
   var _UA = "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Mobile Safari/537.36";
   global.bridge = {
     buildVersion: 290, buildSpecVersion: 3, buildFlavor: "stable", buildPlatform: "android",
-    isLoggedIn: false, captchaUserAgent: _UA, authUserAgent: _UA,
+    isLoggedIn: function () { return false; },
+    captchaUserAgent: _UA, authUserAgent: _UA,
     supportedFeatures: [], supportedContent: [],
     hasPackage: function (name) { return ["Http", "Utilities", "DOMParser", "Bridge"].indexOf(name) >= 0; },
     getHardwareCodecs: function () { return []; },
