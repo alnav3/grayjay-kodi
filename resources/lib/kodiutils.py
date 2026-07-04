@@ -76,6 +76,27 @@ def sources_path():
     return path
 
 
+def resolve_ca_bundle():
+    """Pick a CA bundle that can actually build trust chains on this box.
+
+    Kodi ships `script.module.certifi`, and `requests` uses it by default — but
+    that bundle lags the OS trust store and fails to verify hosts whose root CA
+    is newer than the bundle (e.g. ted.com → 'unable to get local issuer
+    certificate'). The CoreELEC/OS store is kept current, so prefer it. Honor
+    the standard env overrides first; fall back to requests' own default (True)
+    when nothing concrete is found."""
+    for env in ("SSL_CERT_FILE", "REQUESTS_CA_BUNDLE"):
+        p = os.environ.get(env)
+        if p and os.path.isfile(p):
+            return p
+    for p in ("/etc/ssl/cert.pem",                       # CoreELEC / *BSD / macOS
+              "/etc/ssl/certs/ca-certificates.crt",      # Debian/Ubuntu
+              "/etc/pki/tls/certs/ca-bundle.crt"):       # Fedora/RHEL
+        if os.path.isfile(p):
+            return p
+    return True  # let requests use its bundled certifi default
+
+
 def notify(message, heading="Grayjay"):
     if _HAS_KODI:
         import xbmcgui

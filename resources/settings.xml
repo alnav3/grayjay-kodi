@@ -19,6 +19,39 @@
                 </setting>
             </group>
         </category>
+        <category id="playback" label="30016">
+            <group id="1">
+                <setting id="max_video_height" type="integer" label="30017">
+                    <level>0</level>
+                    <default>1080</default>
+                    <constraints>
+                        <options>
+                            <option label="30020">0</option>
+                            <option label="30021">480</option>
+                            <option label="30022">720</option>
+                            <option label="30023">1080</option>
+                            <option label="30024">1440</option>
+                            <option label="30025">2160</option>
+                        </options>
+                    </constraints>
+                    <control type="list" format="integer"/>
+                </setting>
+                <setting id="adaptive_quality" type="boolean" label="30018">
+                    <level>2</level>
+                    <default>false</default>
+                    <control type="toggle"/>
+                </setting>
+                <setting id="async_timeout" type="integer" label="30019">
+                    <level>2</level>
+                    <default>90</default>
+                    <constraints>
+                        <minimum>15</minimum>
+                        <maximum>300</maximum>
+                    </constraints>
+                    <control type="slider" format="integer"/>
+                </setting>
+            </group>
+        </category>
         <category id="updates" label="30013">
             <group id="1">
                 <setting id="auto_update" type="boolean" label="30014">

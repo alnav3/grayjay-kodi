@@ -88,16 +88,32 @@ piwheels** (Raspberry Pi's repo), vendored under
       (`http`, `utility`, `bridge`, `domParser`) and a `URL` polyfill.
 - [x] **Runs real signed community plugins.** PeerTube: `getHome` → 20 real
       videos; `getContentDetails` → real HLS stream URL, end to end on the box.
-- [~] **YouTube** — loads, enables (4.25 MB incl. bundled JSDOM) and runs:
-      `search`, `searchSuggestions`, channels and video metadata all return real
-      data. Required engine work: rewrite `\-` in `/u` regex classes to `\x2d`
-      (quickjs is stricter than V8); `setTimeout`/`WeakRef`/`FinalizationRegistry`
-      stubs; `URL` polyfill; `utility.md5String`; `bridge.isLoggedIn()`; full
-      `http.batch().DUMMY` BatchBuilder (un-gates the session client). The
-      signature **cipher (sig+nsig) solves** via FUTO's remote solver. Remaining
-      blocker: playable stream formats come back empty — YouTube **PO Token /
-      BotGuard** gating, separate from the cipher and the current industry-wide
-      frontier (needs an external PO-token/BotGuard provider).
+- [x] **YouTube** — loads, enables (4.25 MB incl. bundled JSDOM), browses and
+      **plays**: `search`, `searchSuggestions`, channels and video metadata all
+      return real data. Required engine work: rewrite `\-` in `/u` regex classes
+      to `\x2d` (quickjs is stricter than V8); `setTimeout`/`WeakRef`/
+      `FinalizationRegistry` stubs; `URL` polyfill; `utility.md5String`;
+      `bridge.isLoggedIn()`; full `http.batch()` BatchBuilder (un-gates the
+      session client; batched requests execute **concurrently** on the host).
+      The signature **cipher (sig+nsig) solves** via FUTO's remote solver.
+      Playable formats come from the raw ANDROID_VR `youtubei/v1/player`
+      response (direct, range-able URLs for both video and audio), harvested by
+      the HTTP bridge — this **supersedes the previously-planned PO-token /
+      BotGuard provider** for now; a provider only becomes relevant again if
+      YouTube retires direct URLs for that client (SABR-only).
+- [x] **YouTube playback pipeline** — the harvested adaptive formats are
+      synthesized into a DASH MPD for `inputstream.adaptive`, served by a
+      loopback HTTP server in the background service. Media segments are
+      **relayed through the same server**, translating ISA's HTTP `Range`
+      requests into the `range=` query parameter googlevideo reliably honors —
+      making seeking work on both tracks (no video/audio desync, no aborted
+      seeks). By default the manifest carries a **single video + audio
+      representation** (best under Settings → Playback → "Maximum video
+      quality") so ISA never switches representations mid-play — on hardware
+      decoders a switch means a decoder reinit, i.e. a ~1 s black-out at
+      deterministic points. Adaptive switching can be re-enabled in settings.
+      Plugin state (`saveState()`) persists across launches so the expensive
+      session-client init isn't redone on every play.
 - [ ] Other per-plugin gaps: Rumble is bot-blocked (307); Odysee hits a missing
       host function. Lighter API plugins (PeerTube) work best.
 - [x] **Cross-platform subscriptions** — subscribe to a channel *via this addon*

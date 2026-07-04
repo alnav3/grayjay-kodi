@@ -173,6 +173,19 @@
   BatchBuilder.prototype.clientPOST = function (cid, u, b, h) { return this.POST(u, b, h); };
   BatchBuilder.prototype.execute = function () {
     var self = this;
+    // Preferred: one host call executing the whole batch concurrently (as
+    // Grayjay's native client does) — serial round-trips through the single-
+    // request bridge are a large slice of YouTube's start-of-playback delay.
+    if (typeof global.__host_http_batch !== "undefined") {
+      var reqs = this._reqs.map(function (r) {
+        return r[0] === "DUMMY" ? null
+          : { method: r[0], url: r[1], headers: r[2], body: r[3], useAuth: self._http._auth };
+      });
+      var out = hostCall("__host_http_batch", { requests: reqs });
+      if (out && out.responses) {
+        return out.responses.map(function (o) { return o ? new HttpResponse(o) : null; });
+      }
+    }
     return this._reqs.map(function (r) {
       if (r[0] === "DUMMY") return null;
       return self._http._req(r[0], r[1], r[2], r[3]);

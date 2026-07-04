@@ -43,3 +43,44 @@ msgstr ""
 msgctxt "#30015"
 msgid "Update check interval (hours)"
 msgstr ""
+
+# -- Settings: Playback --
+msgctxt "#30016"
+msgid "Playback"
+msgstr ""
+
+msgctxt "#30017"
+msgid "Maximum video quality"
+msgstr ""
+
+msgctxt "#30018"
+msgid "Adaptive quality switching (may glitch on hardware decoders)"
+msgstr ""
+
+msgctxt "#30019"
+msgid "Stream resolve timeout (seconds)"
+msgstr ""
+
+msgctxt "#30020"
+msgid "Auto (no limit)"
+msgstr ""
+
+msgctxt "#30021"
+msgid "480p"
+msgstr ""
+
+msgctxt "#30022"
+msgid "720p"
+msgstr ""
+
+msgctxt "#30023"
+msgid "1080p"
+msgstr ""
+
+msgctxt "#30024"
+msgid "1440p"
+msgstr ""
+
+msgctxt "#30025"
+msgid "2160p (4K)"
+msgstr ""

@@ -56,3 +56,114 @@ jobs:
           assert groups.delete_group(g["id"])
           print("smoke OK")
           PY
+
+      - name: Smoke-test playback pipeline (MPD builder, range proxy, plugin state)
+        run: |
+          python - <<'PY'
+          import json, os, tempfile, threading, time, urllib.request, urllib.error
+          from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+          from resources.lib.playback import mpd, manifest_server
+          from resources.lib.sources import plugin_state
+          from resources.lib.sources.config import SourceConfig
+          from resources.lib.engine.bridge import PluginBridge
+
+          def fmt(itag, mime, **kw):
+              f = {"itag": itag, "mimeType": mime,
+                   "url": "https://gv.example/videoplayback?itag=%s" % itag,
+                   "initRange": {"start": 0, "end": 999},
+                   "indexRange": {"start": 1000, "end": 1999},
+                   "bitrate": 100000, "contentLength": "123456"}
+              f.update(kw)
+              return f
+          formats = [
+              fmt(137, 'video/mp4; codecs="avc1.640028"', width=1920, height=1080, fps=30, bitrate=4000000),
+              fmt(248, 'video/webm; codecs="vp9"', width=1920, height=1080, fps=30, bitrate=3500000),
+              fmt(313, 'video/webm; codecs="vp9"', width=3840, height=2160, fps=30, bitrate=18000000),
+              fmt(251, 'audio/webm; codecs="opus"', bitrate=160000),
+              fmt(140, 'audio/mp4; codecs="mp4a.40.2"', bitrate=128000),
+          ]
+          # Default: one video + one audio rep, cap respected, hw-friendly codecs.
+          m1 = mpd.build_mpd(formats, 60000, max_height=1080)
+          assert m1.count("<Representation") == 2 and "avc1" in m1 and "opus" not in m1
+          assert 'subsegmentStartsWithSAP="1"' in m1
+          # Adaptive keeps everything under the cap.
+          m2 = mpd.build_mpd(formats, 60000, max_height=1080, adaptive=True)
+          assert m2.count("<Representation") == 4 and 'height="2160"' not in m2
+          # url_map rewrites every BaseURL (media goes through the proxy).
+          m3 = mpd.build_mpd(formats, 60000, url_map=lambda f: "http://127.0.0.1:1/s/x/%s" % f["itag"])
+          assert "gv.example" not in m3
+          print("mpd OK")
+
+          # Fake googlevideo: ignores the Range HEADER, honors only ?range=a-b.
+          DATA = bytes(range(256)) * 40
+          class Upstream(BaseHTTPRequestHandler):
+              def log_message(self, *a): pass
+              def do_GET(self):
+                  from urllib.parse import urlparse, parse_qs
+                  q = parse_qs(urlparse(self.path).query)
+                  body = DATA
+                  if "range" in q:
+                      a, b = q["range"][0].split("-")
+                      body = DATA[int(a):int(b) + 1]
+                  self.send_response(200)
+                  self.send_header("Content-Length", str(len(body)))
+                  self.end_headers()
+                  self.wfile.write(body)
+          up = ThreadingHTTPServer(("127.0.0.1", 0), Upstream)
+          threading.Thread(target=up.serve_forever, daemon=True).start()
+          up_url = "http://127.0.0.1:%d/videoplayback?id=1" % up.server_address[1]
+
+          profile = tempfile.mkdtemp(); cache = os.path.join(profile, "cache")
+          server, port = manifest_server.start(cache, profile)
+          secret = manifest_server.proxy_secret(profile)
+          media = manifest_server.media_url(port, secret, up_url, len(DATA), "video/mp4")
+          req = urllib.request.Request(media, headers={"Range": "bytes=100-199"})
+          r = urllib.request.urlopen(req)
+          assert r.status == 206 and r.read() == DATA[100:200]
+          assert r.headers["Content-Range"] == "bytes 100-199/%d" % len(DATA)
+          try:
+              urllib.request.urlopen(media.replace(media.split("/")[4], "0" * 32))
+              assert False, "tampered signature must be rejected"
+          except urllib.error.HTTPError as e:
+              assert e.code == 403
+          server.shutdown(); up.shutdown()
+          print("range proxy OK")
+
+          # plugin_state: round-trip + invalidation on script change.
+          sdir = tempfile.mkdtemp()
+          with open(os.path.join(sdir, "script.js"), "w") as fh:
+              fh.write("var a=1;")
+          cfg = SourceConfig({"id": "t"}, sdir)
+          assert plugin_state.load(cfg) == ""
+          assert plugin_state.save(cfg, '{"session":"tok"}')
+          assert plugin_state.load(cfg) == '{"session":"tok"}'
+          with open(os.path.join(sdir, "script.js"), "w") as fh:
+              fh.write("var a=2;")
+          assert plugin_state.load(cfg) == ""
+          print("plugin_state OK")
+
+          # http.batch host call: concurrent, order-preserving, DUMMY-safe.
+          class Slow(BaseHTTPRequestHandler):
+              def log_message(self, *a): pass
+              def do_GET(self):
+                  time.sleep(0.5)
+                  body = self.path.encode()
+                  self.send_response(200)
+                  self.send_header("Content-Length", str(len(body)))
+                  self.end_headers()
+                  self.wfile.write(body)
+          srv = ThreadingHTTPServer(("127.0.0.1", 0), Slow)
+          threading.Thread(target=srv.serve_forever, daemon=True).start()
+          base = "http://127.0.0.1:%d" % srv.server_address[1]
+          b = PluginBridge.__new__(PluginBridge)
+          b.config = SourceConfig({"id": "t", "allowUrls": ["everywhere"]}, "/tmp")
+          b._stream_harvest, b._muxed_harvest = [], []
+          reqs = [None] + [{"method": "GET", "url": "%s/%d" % (base, i)} for i in range(4)]
+          t0 = time.time()
+          out = json.loads(b._host_http_batch(json.dumps({"requests": reqs})))
+          assert out["responses"][0] is None
+          assert [r["body"] for r in out["responses"][1:]] == ["/%d" % i for i in range(4)]
+          assert time.time() - t0 < 1.5, "batch ran serially"
+          srv.shutdown()
+          print("http batch OK")
+          PY

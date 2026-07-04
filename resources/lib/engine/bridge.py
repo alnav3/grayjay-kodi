@@ -13,7 +13,7 @@ import json
 import os
 import uuid
 
-from ..kodiutils import log
+from ..kodiutils import log, resolve_ca_bundle
 from .jsengine import JSEngine
 
 try:
@@ -25,29 +25,8 @@ import urllib.request as _urlreq
 import urllib.error  # noqa: F401  (exposes _urlreq.HTTPError reliably)
 
 
-def _resolve_ca_bundle():
-    """Pick a CA bundle that can actually build trust chains on this box.
-
-    Kodi ships `script.module.certifi`, and `requests` uses it by default — but
-    that bundle lags the OS trust store and fails to verify hosts whose root CA
-    is newer than the bundle (e.g. ted.com → 'unable to get local issuer
-    certificate'). The CoreELEC/OS store is kept current, so prefer it. Honor
-    the standard env overrides first; fall back to requests' own default (True)
-    when nothing concrete is found."""
-    for env in ("SSL_CERT_FILE", "REQUESTS_CA_BUNDLE"):
-        p = os.environ.get(env)
-        if p and os.path.isfile(p):
-            return p
-    for p in ("/etc/ssl/cert.pem",                       # CoreELEC / *BSD / macOS
-              "/etc/ssl/certs/ca-certificates.crt",      # Debian/Ubuntu
-              "/etc/pki/tls/certs/ca-bundle.crt"):       # Fedora/RHEL
-        if os.path.isfile(p):
-            return p
-    return True  # let requests use its bundled certifi default
-
-
 # Resolved once: a filesystem path to a CA bundle, or True (requests default).
-_CA_BUNDLE = _resolve_ca_bundle()
+_CA_BUNDLE = resolve_ca_bundle()
 
 
 _DIR = os.path.dirname(os.path.abspath(__file__))
@@ -81,15 +60,40 @@ class PluginBridge(object):
         return None
 
     def _host_http(self, payload_json):
-        data = json.loads(payload_json)
+        return json.dumps(self._do_http(json.loads(payload_json)))
+
+    def _host_http_batch(self, payload_json):
+        """Execute a BatchBuilder's requests concurrently.
+
+        Grayjay runs `http.batch()` requests in parallel; running them one
+        after another through the single-request bridge multiplies every
+        network round-trip — the YouTube session-client init batches several
+        innertube calls, and serial execution is a large slice of the
+        select-to-playback delay. DUMMY slots come in as null and stay null;
+        response order matches request order."""
+        reqs = json.loads(payload_json).get("requests") or []
+        results = [None] * len(reqs)
+        live = [(i, r) for i, r in enumerate(reqs) if r]
+        if len(live) == 1:
+            i, r = live[0]
+            results[i] = self._do_http(r)
+        elif live:
+            from concurrent.futures import ThreadPoolExecutor
+            with ThreadPoolExecutor(max_workers=min(6, len(live))) as pool:
+                futures = [(i, pool.submit(self._do_http, r)) for i, r in live]
+                for i, fut in futures:
+                    results[i] = fut.result()
+        return json.dumps({"responses": results})
+
+    def _do_http(self, data):
         method = (data.get("method") or "GET").upper()
         url = data.get("url")
         headers = data.get("headers") or {}
         body = data.get("body")
         # allowUrls enforcement (basic): if config restricts domains, honor it.
         if not self.config.url_allowed(url):
-            return json.dumps({"url": url, "code": 0, "headers": {}, "body": "",
-                               "error": "URL blocked by plugin allowUrls"})
+            return {"url": url, "code": 0, "headers": {}, "body": "",
+                    "error": "URL blocked by plugin allowUrls"}
         # Ensure a browser-like UA unless the plugin set one (many sites 403 the
         # default urllib/python agent).
         if not any(k.lower() == "user-agent" for k in headers):
@@ -106,10 +110,10 @@ class PluginBridge(object):
                                          data=body, timeout=20, allow_redirects=True,
                                          verify=_CA_BUNDLE)
                 self._harvest_streams(url, resp.status_code, resp.text)
-                return json.dumps({
+                return {
                     "url": resp.url, "code": resp.status_code,
                     "headers": dict(resp.headers), "body": resp.text,
-                })
+                }
             req = _urlreq.Request(url, method=method, headers=headers,
                                   data=body.encode("utf-8") if body else None)
             try:
@@ -118,16 +122,16 @@ class PluginBridge(object):
                 # Non-2xx: return the response rather than raising, so the
                 # plugin can inspect status/body (e.g. to detect captchas).
                 body_txt = he.read().decode("utf-8", "replace") if hasattr(he, "read") else ""
-                return json.dumps({"url": url, "code": he.code,
-                                   "headers": dict(he.headers or {}), "body": body_txt})
+                return {"url": url, "code": he.code,
+                        "headers": dict(he.headers or {}), "body": body_txt}
             with r:
                 raw = r.read().decode("utf-8", "replace")
                 self._harvest_streams(url, r.status, raw)
-                return json.dumps({"url": r.geturl(), "code": r.status,
-                                   "headers": dict(r.headers), "body": raw})
+                return {"url": r.geturl(), "code": r.status,
+                        "headers": dict(r.headers), "body": raw}
         except Exception as exc:
             log("http error %s: %s" % (url, exc), "warning")
-            return json.dumps({"url": url, "code": 0, "headers": {}, "body": "", "error": str(exc)})
+            return {"url": url, "code": 0, "headers": {}, "body": "", "error": str(exc)}
 
     def _harvest_streams(self, url, code, body):
         """Sniff direct-URL adaptive formats from a YouTube player response.
@@ -209,6 +213,7 @@ class PluginBridge(object):
         e = self.engine
         e.register("__host_log", self._host_log)
         e.register("__host_http", self._host_http)
+        e.register("__host_http_batch", self._host_http_batch)
         e.register("__host_b64encode", self._host_b64encode)
         e.register("__host_b64decode", self._host_b64decode)
         e.register("__host_uuid", self._host_uuid)
@@ -289,6 +294,28 @@ class PluginBridge(object):
             self.engine.drain_jobs()
         except Exception:
             pass
+
+    def save_state(self):
+        """Capture `source.saveState()` (a string), or None when the plugin
+        doesn't implement it / has nothing to save. Persisted by the caller and
+        fed back into the next `enable(config, settings, savedState)` so
+        expensive per-session init (e.g. YouTube's session client) survives the
+        short-lived Kodi plugin process."""
+        if not self._loaded:
+            return None
+        try:
+            out = self.engine.eval(
+                "JSON.stringify((function(){"
+                "  if (typeof source.saveState !== 'function') return '';"
+                "  var s = source.saveState();"
+                "  return typeof s === 'string' ? s : (s ? JSON.stringify(s) : '');"
+                "})())"
+            )
+            state = json.loads(out) if out else ""
+        except Exception as exc:
+            log("saveState failed for %s: %s" % (self.config.id, exc), "debug")
+            return None
+        return state if isinstance(state, str) and state else None
 
     def _async_deadline(self):
         """How long to pump the event loop for an async source method (s)."""

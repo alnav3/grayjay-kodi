@@ -102,16 +102,32 @@ class Router(object):
             cache = self._bridges = {}
         if source_id in cache:
             return cache[source_id]
-        from .sources import manager, plugin_settings
+        from .sources import manager, plugin_settings, plugin_state
         from .engine.bridge import PluginBridge
         cfg = manager.get_source(source_id)
         if cfg is None:
             cache[source_id] = None
             return None
         bridge = PluginBridge(cfg)
-        bridge.enable(settings=plugin_settings.load(cfg))
+        # Feed back the plugin's persisted saveState() so a fresh Kodi plugin
+        # process doesn't redo expensive session init (YouTube: innertube
+        # context + BotGuard) on every single invocation.
+        bridge.enable(settings=plugin_settings.load(cfg),
+                      saved_state=plugin_state.load(cfg) or None)
+        self._persist_state(bridge)
         cache[source_id] = bridge
         return bridge
+
+    @staticmethod
+    def _persist_state(bridge):
+        """Best-effort: store the source's current saveState() for next launch."""
+        try:
+            from .sources import plugin_state
+            state = bridge.save_state()
+            if state:
+                plugin_state.save(bridge.config, state)
+        except Exception as exc:
+            log("persisting state failed: %s" % exc, "debug")
 
     def _run(self, source_id, method, args):
         """Call a source method, returning a flat results list ([] on error)."""
@@ -669,18 +685,20 @@ class Router(object):
         return menu
 
     def action_play(self):
-        from .sources import manager, plugin_settings
-        from .engine.bridge import PluginBridge
-
         source_id = self.args.get("source")
         content_url = self.args.get("url")
-        cfg = manager.get_source(source_id)
-        if cfg is None:
+        t0 = time.time()
+        bridge = self._bridge(source_id)
+        if bridge is None:
             notify("Source not found")
             return
-        bridge = PluginBridge(cfg)
-        bridge.enable(settings=plugin_settings.load(cfg))
+        cfg = bridge.config
+        t_enable = time.time() - t0
         details = bridge.call("getContentDetails", [content_url])
+        log("play: enable %.1fs, getContentDetails %.1fs (%s)"
+            % (t_enable, time.time() - t0 - t_enable, source_id), "info")
+        # The details call refreshes session tokens; keep them for next launch.
+        self._persist_state(bridge)
 
         # Preferred: a ready-made manifest/progressive URL (PeerTube HLS, etc.).
         play_url = self._pick_stream(details)
@@ -696,8 +714,7 @@ class Router(object):
         # tracks combined into a DASH manifest for inputstream.adaptive. ISA
         # only loads a manifest over HTTP, so this needs the background service's
         # manifest server to be up.
-        mpd_path = self._build_dash(cfg, bridge, details)
-        manifest_url = self._manifest_url(mpd_path)
+        manifest_url = self._build_dash(cfg, bridge, details)
         if manifest_url:
             if _HAS_KODI:
                 li = xbmcgui.ListItem(path=manifest_url)
@@ -725,26 +742,6 @@ class Router(object):
 
         notify("No playable stream found")
 
-    def _manifest_url(self, mpd_path):
-        """If a DASH manifest was built and the loopback manifest server is
-        alive, return the http:// URL ISA should fetch; else None (caller falls
-        back to a muxed stream)."""
-        if not mpd_path:
-            return None
-        import os
-        import socket
-        from .playback import manifest_server
-        from .kodiutils import profile_path
-        port = manifest_server.published_port(profile_path())
-        if not port:
-            return None
-        try:
-            sock = socket.create_connection(("127.0.0.1", port), timeout=1)
-            sock.close()
-        except OSError:
-            return None
-        return "http://127.0.0.1:%d/%s" % (port, os.path.basename(mpd_path))
-
     def _pick_muxed(self, bridge):
         """Highest-resolution muxed/progressive URL harvested from the player
         response (single audio+video stream), or None."""
@@ -759,30 +756,68 @@ class Router(object):
         return best
 
     def _build_dash(self, cfg, bridge, details):
-        """Synthesise a DASH MPD from harvested adaptive formats; return a path
-        to the written manifest, or None."""
-        from .playback import mpd as mpd_builder
-        from .kodiutils import profile_path
+        """Synthesise a DASH MPD from harvested adaptive formats and stage it
+        on the loopback manifest server; return the http:// URL ISA should
+        fetch, or None (caller falls back to a muxed stream).
+
+        Media URLs in the manifest point back at the same loopback server,
+        which relays them to googlevideo translating ISA's HTTP Range requests
+        into the `range=` query parameter the CDN reliably honors — otherwise
+        seeks are applied to one track but not the other (or fail outright)."""
         import os
+        import socket
+        from .playback import mpd as mpd_builder, manifest_server
+        from .kodiutils import profile_path, get_setting
 
         formats = bridge.harvested_streams()
         if not formats:
             return None
+        # ISA only loads manifests over HTTP, so without the background
+        # service's server there is no DASH playback at all.
+        profile = profile_path()
+        port = manifest_server.published_port(profile)
+        if not port:
+            return None
+        try:
+            socket.create_connection(("127.0.0.1", port), timeout=1).close()
+        except OSError:
+            return None
+
+        try:
+            max_height = int(get_setting("max_video_height", "1080"))
+        except (TypeError, ValueError):
+            max_height = 1080
+        adaptive = get_setting("adaptive_quality", "false") == "true"
+        secret = manifest_server.proxy_secret(profile)
+
+        def proxied(fmt):
+            try:
+                content_length = int(fmt.get("contentLength") or 0)
+            except (TypeError, ValueError):
+                content_length = 0
+            mime = (fmt.get("mimeType") or "").split(";")[0].strip()
+            return manifest_server.media_url(port, secret, fmt.get("url"),
+                                             content_length=content_length,
+                                             mime=mime)
+
         dur_ms = 0
         try:
             dur_ms = int((details or {}).get("duration") or 0) * 1000
         except (TypeError, ValueError):
             dur_ms = 0
-        manifest = mpd_builder.build_mpd(formats, dur_ms or None)
+        manifest = mpd_builder.build_mpd(formats, dur_ms or None,
+                                         url_map=proxied,
+                                         max_height=max_height,
+                                         adaptive=adaptive)
         if not manifest:
             return None
-        cache = os.path.join(profile_path(), "cache")
+        cache = os.path.join(profile, "cache")
         if not os.path.isdir(cache):
             os.makedirs(cache)
         path = os.path.join(cache, "stream_%s.mpd" % cfg.id)
         with open(path, "w", encoding="utf-8") as fh:
             fh.write(manifest)
-        return path
+        return "http://127.0.0.1:%d/%s" % (port, os.path.basename(path))
 
     def _pick_stream(self, details):
         """Pick a directly-playable URL: a real HLS/DASH *manifest* or a muxed
