@@ -221,7 +221,7 @@ class Router(object):
         from .sources import updates
         if _HAS_KODI:
             notify("Checking for source updates…")
-        applied, checked = updates.update_all(notify_summary=False)
+        applied, checked = updates.update_all()
         errors = [c for c in checked if c.get("error")]
         if applied:
             notify("Updated %d source(s)" % len(applied))

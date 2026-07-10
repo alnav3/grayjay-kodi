@@ -43,7 +43,7 @@ def _run_check():
         return
     log("service: checking for source updates", "info")
     try:
-        applied, _checked = updates.update_all(notify_summary=True)
+        applied, _checked = updates.update_all()
         log("service: %d source(s) updated" % len(applied), "info")
     except Exception as exc:
         log("service: update run failed: %s" % exc, "error")

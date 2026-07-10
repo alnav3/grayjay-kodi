@@ -116,21 +116,26 @@ def check_all():
     return [check_source(cfg) for cfg in manager.list_sources()]
 
 
-def update_all(notify_summary=True):
+def update_all():
     """Apply available updates to every installed source.
 
     Returns (updated, checked) lists of info dicts. Sources are re-loaded fresh
-    so each carries its current on-disk version."""
+    so each carries its current on-disk version.
+
+    Applied updates are logged, never surfaced as a Kodi notification: the
+    background auto-updater runs silently so it doesn't pop toasts over whatever
+    the user is watching. Callers that want user-facing feedback (e.g. the manual
+    menu action) emit their own notifications."""
     updated, checked = [], []
     for cfg in manager.list_sources():
         applied, info = update_source(cfg)
         checked.append(info)
         if applied:
             updated.append(info)
-    if notify_summary and updated:
+    if updated:
         names = ", ".join(u["name"] for u in updated)
-        notify("Updated %d source(s): %s" % (len(updated), names))
-    elif notify_summary and not any(c["error"] for c in checked):
+        log("updated %d source(s): %s" % (len(updated), names), "info")
+    elif not any(c["error"] for c in checked):
         log("source update check: all %d up to date" % len(checked), "info")
     return updated, checked
 
