@@ -36,6 +36,11 @@
                     </constraints>
                     <control type="list" format="integer"/>
                 </setting>
+                <setting id="autoplay_next" type="boolean" label="30026">
+                    <level>0</level>
+                    <default>true</default>
+                    <control type="toggle"/>
+                </setting>
                 <setting id="adaptive_quality" type="boolean" label="30018">
                     <level>2</level>
                     <default>false</default>

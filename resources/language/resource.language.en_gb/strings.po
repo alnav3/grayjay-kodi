@@ -84,3 +84,7 @@ msgstr ""
 msgctxt "#30025"
 msgid "2160p (4K)"
 msgstr ""
+
+msgctxt "#30026"
+msgid "Autoplay next video from the same list (Up Next)"
+msgstr ""

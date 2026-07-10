@@ -57,6 +57,56 @@ jobs:
           print("smoke OK")
           PY
 
+      - name: Smoke-test watch state (history, On Deck, play queues, Up Next)
+        run: |
+          python - <<'PY'
+          import tempfile
+          from urllib.parse import parse_qsl
+          import resources.lib.kodiutils as k
+          k.profile_path = lambda _sb=tempfile.mkdtemp(): _sb
+          from resources.lib import watch
+          from resources.lib.router import Router
+
+          # progress below the noise floor is ignored; above it lands On Deck
+          assert not watch.record_progress("s", "u1", "Vid", "", 10, 600)
+          assert watch.record_progress("s", "u1", "Vid", "", 120, 600)
+          assert watch.list_on_deck()[0]["position"] == 120
+          # past 90% flips to watched: off deck, into history
+          watch.record_progress("s", "u1", "Vid", "", 580, 600)
+          assert watch.list_on_deck() == []
+          assert watch.list_history()[0]["playcount"] == 1
+          watch.clear_history()
+          assert watch.list_history() == []
+
+          # a rendered listing snapshots its playable items as a queue and
+          # tags play URLs with qid/idx so "Up next" can find the follower
+          r = Router(["plugin://plugin.video.grayjay/", "-1", "?action=home&source=s"])
+          lst = [
+              ("plugin://plugin.video.grayjay/?action=play&source=s&url=a", "One",
+               False, "t1", {"mediatype": "video", "duration": 100}, []),
+              ("plugin://plugin.video.grayjay/?action=play&source=s&url=b", "Two",
+               False, "t2", {"mediatype": "video", "duration": 200}, []),
+          ]
+          out = r._attach_queue(lst)
+          q = dict(parse_qsl(out[0][0].split("?", 1)[1]))
+          nxt = watch.queue_item(q["qid"], int(q["idx"]) + 1)
+          assert nxt["name"] == "Two" and nxt["play"] == out[1][0]
+          assert watch.queue_item(q["qid"], int(q["idx"]) + 2) is None
+          assert watch.queue_item("../evil", 0) is None
+
+          # resolve→start handoff is claim-once and freshness-gated
+          watch.set_now_playing({"source": "s", "url": "a", "qid": q["qid"], "idx": 0})
+          assert watch.claim_now_playing()["url"] == "a"
+          assert watch.claim_now_playing() is None
+
+          # resume/playcount decorate feed items
+          watch.record_progress("s", "http://v/1", "One", "", 50, 100)
+          r2 = Router(["plugin://plugin.video.grayjay/", "-1", "?action=home&source=s"])
+          info = r2._video_info("s", {"name": "One", "url": "http://v/1", "duration": 100}, False)
+          assert info["resume"] == 50 and "50% watched" in info["label2"]
+          print("watch OK")
+          PY
+
       - name: Smoke-test playback pipeline (MPD builder, range proxy, plugin state)
         run: |
           python - <<'PY'

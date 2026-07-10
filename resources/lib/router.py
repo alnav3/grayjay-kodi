@@ -151,6 +151,8 @@ class Router(object):
         # Subscriptions first — the cross-platform feed of channels you follow.
         items.append((self.url_for(action="subscriptions"),
                       "[ Subscriptions ]", True, ""))
+        items.append((self.url_for(action="on_deck"), "[ On Deck ]", True, ""))
+        items.append((self.url_for(action="history"), "[ History ]", True, ""))
         for cfg in manager.list_sources():
             ctx = [
                 ("Settings",
@@ -607,6 +609,82 @@ class Router(object):
         notify("Updated groups for %s" % (name or url))
         xbmc.executebuiltin("Container.Refresh")
 
+    # -- watch history / on deck --------------------------------------------
+    def action_on_deck(self):
+        """Partially watched videos, most recent first, with resume points."""
+        from . import watch
+        entries = watch.list_on_deck()
+        if not entries:
+            self._render([(self.url_for(action="root"),
+                           "Nothing on deck — partially watched videos land here",
+                           False, "")])
+            return
+        items = [self._watch_item(e, [
+            ("Mark as watched",
+             "RunPlugin(%s)" % self.url_for(action="watch_markwatched",
+                                            source=e.get("source"), url=e.get("url"))),
+            ("Remove from On Deck",
+             "RunPlugin(%s)" % self.url_for(action="watch_remove",
+                                            source=e.get("source"), url=e.get("url"))),
+        ]) for e in entries]
+        self._render(items, content_type="videos")
+
+    def action_history(self):
+        """Watched videos, most recently watched first."""
+        from . import watch
+        entries = watch.list_history()
+        if not entries:
+            self._render([(self.url_for(action="root"),
+                           "No watch history yet", False, "")])
+            return
+        items = [self._watch_item(e, [
+            ("Remove from history",
+             "RunPlugin(%s)" % self.url_for(action="watch_remove",
+                                            source=e.get("source"), url=e.get("url"))),
+            ("Clear all history",
+             "RunPlugin(%s)" % self.url_for(action="history_clear")),
+        ]) for e in entries]
+        self._render(items, content_type="videos")
+
+    def _watch_item(self, e, extra_ctx):
+        """A watch-state entry rendered like a feed item; thumbnail, duration
+        and the 'x ago' line (last watched) come from the stored entry rather
+        than a source call."""
+        v = {
+            "name": e.get("name") or e.get("url"),
+            "url": e.get("url"),
+            "thumbnails": {"sources": [{"url": e.get("thumbnail", "")}]},
+            "duration": e.get("duration") or 0,
+            "datetime": e.get("updated") or 0,
+        }
+        return self._content_item(e.get("source"), v, show_source=True,
+                                  extra_ctx=extra_ctx)
+
+    def action_watch_remove(self):
+        from . import watch
+        if watch.remove(self.args.get("source"), self.args.get("url")):
+            notify("Removed")
+        if _HAS_KODI:
+            xbmc.executebuiltin("Container.Refresh")
+
+    def action_watch_markwatched(self):
+        from . import watch
+        watch.mark_watched(self.args.get("source"), self.args.get("url"))
+        notify("Marked as watched")
+        if _HAS_KODI:
+            xbmc.executebuiltin("Container.Refresh")
+
+    def action_history_clear(self):
+        from . import watch
+        if _HAS_KODI:
+            if not xbmcgui.Dialog().yesno("Clear history",
+                                          "Remove all watched items from history?"):
+                return
+        watch.clear_history()
+        notify("History cleared")
+        if _HAS_KODI:
+            xbmc.executebuiltin("Container.Refresh")
+
     def _source_name(self, source_id):
         """Display name for a source id, cached for the request."""
         cache = getattr(self, "_src_names", None)
@@ -615,7 +693,7 @@ class Router(object):
             cache = self._src_names = {c.id: c.name for c in manager.list_sources()}
         return cache.get(source_id, source_id)
 
-    def _content_item(self, source_id, v, show_source=False):
+    def _content_item(self, source_id, v, show_source=False, extra_ctx=None):
         title = v.get("name", "Untitled")
         url = self.url_for(action="play", source=source_id, url=v.get("url", ""))
         thumb = ""
@@ -623,7 +701,18 @@ class Router(object):
         if thumbs:
             thumb = thumbs[-1].get("url", "")
         info = self._video_info(source_id, v, show_source)
-        return (url, title, False, thumb, info, self._context_menu(source_id, v))
+        ctx = (extra_ctx or []) + self._context_menu(source_id, v)
+        return (url, title, False, thumb, info, ctx)
+
+    def _watch_entry(self, source_id, url):
+        """This video's watch-state entry (resume point / play count), from a
+        per-request snapshot of the whole state file."""
+        cache = getattr(self, "_watch_map", None)
+        if cache is None:
+            from . import watch
+            cache = self._watch_map = {
+                (e.get("source"), e.get("url")): e for e in watch.all_entries()}
+        return cache.get((source_id, url))
 
     def _video_info(self, source_id, v, show_source):
         """Grayjay-style metadata for a video item: the
@@ -636,6 +725,11 @@ class Router(object):
         is_live = bool(v.get("isLive"))
         src = self._source_name(source_id)
 
+        entry = self._watch_entry(source_id, v.get("url")) or {}
+        playcount = int(entry.get("playcount") or 0)
+        resume = float(entry.get("position") or 0)
+        resume_total = float(entry.get("duration") or 0) or float(dur or 0)
+
         parts = []
         if show_source and src:
             parts.append(src)
@@ -645,6 +739,8 @@ class Router(object):
             parts.append("LIVE")
         elif views and views > 0:
             parts.append("%s views" % _human_count(views))
+        if resume > 0 and resume_total > resume:
+            parts.append("%d%% watched" % round(100.0 * resume / resume_total))
         if dt:
             parts.append(_relative_time(dt))
         metaline = "  •  ".join(parts)
@@ -652,7 +748,7 @@ class Router(object):
         desc = v.get("description") or ""
         plot = "%s\n\n%s" % (metaline, desc) if (metaline and desc) else (desc or metaline)
 
-        return {
+        info = {
             "mediatype": "video",
             "label2": metaline,
             "plot": plot,
@@ -663,6 +759,12 @@ class Router(object):
             "dateadded": _fmt_datetime(dt) if dt else "",
             "live": is_live,
         }
+        if playcount:
+            info["playcount"] = playcount
+        if resume > 0 and resume_total > resume:
+            info["resume"] = resume
+            info["total"] = resume_total
+        return info
 
     def _context_menu(self, source_id, v):
         """Right-click menu: Subscribe to / Unsubscribe from this video's
@@ -703,6 +805,7 @@ class Router(object):
         # Preferred: a ready-made manifest/progressive URL (PeerTube HLS, etc.).
         play_url = self._pick_stream(details)
         if play_url:
+            self._handoff_now_playing(source_id, content_url, details)
             if _HAS_KODI:
                 li = xbmcgui.ListItem(path=play_url)
                 xbmcplugin.setResolvedUrl(self.handle, True, li)
@@ -716,6 +819,7 @@ class Router(object):
         # manifest server to be up.
         manifest_url = self._build_dash(cfg, bridge, details)
         if manifest_url:
+            self._handoff_now_playing(source_id, content_url, details)
             if _HAS_KODI:
                 li = xbmcgui.ListItem(path=manifest_url)
                 li.setMimeType("application/dash+xml")
@@ -732,6 +836,7 @@ class Router(object):
         # manifest server isn't available or there are no adaptive tracks.
         muxed_url = self._pick_muxed(bridge)
         if muxed_url:
+            self._handoff_now_playing(source_id, content_url, details)
             if _HAS_KODI:
                 li = xbmcgui.ListItem(path=muxed_url)
                 li.setContentLookup(False)
@@ -741,6 +846,35 @@ class Router(object):
             return
 
         notify("No playable stream found")
+
+    def _handoff_now_playing(self, source_id, content_url, details):
+        """Leave the background service a note about what is about to play so
+        it can track watch progress and queue "Up next" — this process exits
+        right after setResolvedUrl and can't observe the player itself."""
+        try:
+            from . import watch
+            qid = self.args.get("qid", "")
+            idx = self.args.get("idx", "")
+            d = details or {}
+            name = d.get("name") or ""
+            duration = d.get("duration") or 0
+            thumb = ""
+            thumbs = (d.get("thumbnails") or {}).get("sources") or []
+            if thumbs:
+                thumb = thumbs[-1].get("url", "")
+            if qid and (not name or not thumb or not duration):
+                qi = watch.queue_item(qid, idx)
+                if qi:
+                    name = name or qi.get("name", "")
+                    thumb = thumb or qi.get("thumbnail", "")
+                    duration = duration or qi.get("duration") or 0
+            watch.set_now_playing({
+                "source": source_id, "url": content_url, "name": name,
+                "thumbnail": thumb, "duration": duration,
+                "qid": qid, "idx": idx,
+            })
+        except Exception as exc:
+            log("now-playing handoff failed: %s" % exc, "debug")
 
     def _pick_muxed(self, bridge):
         """Highest-resolution muxed/progressive URL harvested from the player
@@ -857,7 +991,42 @@ class Router(object):
         return best
 
     # -- rendering --------------------------------------------------------
+    def _attach_queue(self, items):
+        """Snapshot this listing's playable items and tag their play URLs with
+        a queue id + index, so the player monitor can offer "Up next" — the
+        following item from whatever list playback was started from."""
+        playable = []
+        for i, it in enumerate(items):
+            query = it[0].split("?", 1)
+            q = dict(parse_qsl(query[1])) if len(query) == 2 else {}
+            if q.get("action") == "play" and q.get("url"):
+                playable.append((i, q))
+        if not playable:
+            return items
+        from . import watch
+        import json
+        # Keyed on listing identity + contents: re-rendering the same list
+        # reuses one snapshot file, a changed list gets a fresh one so stale
+        # play URLs still resolve against the queue they were rendered with.
+        qid = watch.make_queue_id(json.dumps(
+            {"args": self.args, "urls": [q["url"] for _, q in playable]},
+            sort_keys=True))
+        out = list(items)
+        queue = []
+        for pos, (i, q) in enumerate(playable):
+            it = list(out[i])
+            it[0] = "%s&%s" % (it[0], urlencode({"qid": qid, "idx": pos}))
+            out[i] = tuple(it)
+            info = it[4] if len(it) > 4 and isinstance(it[4], dict) else {}
+            queue.append({"play": it[0], "source": q.get("source"),
+                          "url": q["url"], "name": it[1],
+                          "thumbnail": it[3] if len(it) > 3 else "",
+                          "duration": info.get("duration") or 0})
+        watch.save_queue(qid, queue)
+        return out
+
     def _render(self, items, content_type=None):
+        items = self._attach_queue(items)
         if not _HAS_KODI or self.handle < 0:
             for it in items:
                 log("ITEM %s -> %s" % (it[1], it[0]), "info")
@@ -907,6 +1076,18 @@ class Router(object):
                 vt.setPremiered(info["premiered"])
             if info.get("dateadded"):
                 vt.setDateAdded(info["dateadded"])
+            if info.get("playcount"):
+                try:
+                    vt.setPlaycount(int(info["playcount"]))
+                except Exception:
+                    pass
+            if info.get("resume") and info.get("total"):
+                # Resume point → Kodi offers "Resume from …" and seeks there.
+                try:
+                    vt.setResumePoint(float(info["resume"]), float(info["total"]))
+                except Exception:
+                    li.setProperty("ResumeTime", str(info["resume"]))
+                    li.setProperty("TotalTime", str(info["total"]))
         except Exception:
             # Older Kodi without the InfoTagVideo setters.
             data = {"mediatype": "video", "title": label}
@@ -922,7 +1103,12 @@ class Router(object):
                 data["premiered"] = info["premiered"]
             if info.get("dateadded"):
                 data["dateadded"] = info["dateadded"]
+            if info.get("playcount"):
+                data["playcount"] = int(info["playcount"])
             try:
                 li.setInfo("video", data)
             except Exception:
                 pass
+            if info.get("resume") and info.get("total"):
+                li.setProperty("ResumeTime", str(info["resume"]))
+                li.setProperty("TotalTime", str(info["total"]))

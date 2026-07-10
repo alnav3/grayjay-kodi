@@ -20,6 +20,9 @@ default.py                     Kodi entry point
 resources/lib/
   router.py                    plugin:// routing → Kodi ListItems / player
   kodiutils.py                 xbmc* wrappers (stubbable off-Kodi)
+  watch.py                     History / On Deck state + play-queue snapshots
+  playback/
+    monitor.py                 service-side player monitor ("Up Next" autoplay)
   sources/
     config.py                  SourceV8PluginConfig parsing
     manager.py                 install / list / remove sources
