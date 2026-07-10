@@ -4,20 +4,34 @@
 Grayjay source plugins are JavaScript executed against an embedded engine
 (Grayjay itself uses V8). Inside Kodi we only have CPython, so we need a JS
 runtime reachable from Python that also lets JS call *back* into Python
-(HTTP, logging, crypto). Two backends are supported, in preference order:
+(HTTP, logging, crypto). Backends, in preference order:
 
-1. ``quickjs``      - QuickJS bindings. Small, pure-ish, supports host
-                      callables. Easiest to ship as an aarch64 wheel.
-2. ``py_mini_racer`` - V8 bindings. Fast and battle-tested but eval-only
+1. ``qjs_subprocess`` - a standalone, statically-linked quickjs-ng CLI binary
+                      (vendored per-arch), driven as a persistent subprocess
+                      over stdin/stdout + a pair of pipes for host callbacks
+                      (see qjs_driver.js). Newer and more spec-compliant than
+                      the embedded quickjs Python binding below - in
+                      particular it doesn't hit the bytecode-compiler bug
+                      ("InternalError: unconsistent stack size") that binding
+                      occasionally hits on YouTube's live, rotating player
+                      bundle. Preferred whenever a matching binary is vendored
+                      for the current machine.
+2. ``quickjs``      - QuickJS Python bindings (in-process, native extension).
+                      Small, supports host callables. Used when no
+                      qjs_subprocess binary is vendored for this arch (e.g.
+                      dev machines) but the extension is installed.
+3. ``py_mini_racer`` - V8 bindings. Fast and battle-tested but eval-only
                       (no synchronous host callbacks), so HTTP has to be
                       pre-resolved. Used only as a fallback.
-3. ``js2py``        - Pure Python (ES5/6). Slow and partial, but needs no
+4. ``js2py``        - Pure Python (ES5/6). Slow and partial, but needs no
                       compiler and can be VENDORED into the addon, so it runs
                       on locked-down targets (e.g. CoreELEC: no pip/compiler).
-                      Supports host callables. Default fallback on such boxes.
+                      Supports host callables. Fallback when nothing above is
+                      available.
 
-The native backends need a build matching Kodi's bundled Python ABI on the
-target arch; js2py sidesteps that entirely. See README.md.
+The native backends need a build matching the target arch (and, for the
+in-process quickjs binding, Kodi's bundled Python ABI too); js2py sidesteps
+that entirely. See README.md.
 """
 import os
 import platform
@@ -58,6 +72,21 @@ def _native_vendor_dir():
 _NATIVE = _native_vendor_dir()
 if _NATIVE and _NATIVE not in sys.path:
     sys.path.insert(0, _NATIVE)
+
+
+def _qjs_subprocess_binary():
+    """Locate a vendored standalone qjs binary matching this machine's arch.
+
+    Unlike the in-process quickjs Python extension, this is a plain executable
+    (statically linked) - only the CPU arch needs to match, not the Python
+    ABI/version."""
+    machine = platform.machine()  # e.g. 'armv7l'
+    path = os.path.join(_HERE, "vendor_native", machine, "bin", "qjs")
+    return path if os.path.isfile(path) else None
+
+
+_QJS_SUBPROCESS_BIN = _qjs_subprocess_binary()
+_QJS_SUBPROCESS_DRIVER = os.path.join(_HERE, "qjs_driver.js")
 
 
 def _preload_libatomic():
@@ -109,6 +138,7 @@ class JSEngine(object):
         forced = os.environ.get("GRAYJAY_JS_BACKEND")
         if forced:
             init = {
+                "qjs_subprocess": self._init_qjs_subprocess,
                 "quickjs": self._init_quickjs,
                 "py_mini_racer": self._init_mini_racer,
                 "js2py": self._init_js2py,
@@ -119,6 +149,14 @@ class JSEngine(object):
             init()
             log("JS backend: %s (forced)" % forced, "info")
             return
+        if _QJS_SUBPROCESS_BIN:
+            try:
+                self._init_qjs_subprocess()
+                self.backend = "qjs_subprocess"
+                log("JS backend: qjs_subprocess (%s)" % _QJS_SUBPROCESS_BIN, "info")
+                return
+            except Exception as exc:
+                log("qjs_subprocess unavailable, falling back: %s" % exc, "warning")
         try:
             import quickjs  # noqa: F401
             self.backend = "quickjs"
@@ -148,6 +186,107 @@ class JSEngine(object):
             "'py_mini_racer', or vendor 'js2py' into resources/lib/engine/vendor. "
             "See README.md."
         )
+
+    # -- qjs_subprocess -----------------------------------------------------
+    def _init_qjs_subprocess(self):
+        import subprocess
+        req_r, req_w = os.pipe()   # child writes host-call requests to req_w
+        resp_r, resp_w = os.pipe()  # parent writes host-call responses to resp_w
+        try:
+            proc = subprocess.Popen(
+                [_QJS_SUBPROCESS_BIN, "-m", _QJS_SUBPROCESS_DRIVER,
+                 str(req_w), str(resp_r)],
+                pass_fds=(req_w, resp_r),
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE, bufsize=1,
+                universal_newlines=True,
+            )
+        finally:
+            os.close(req_w)
+            os.close(resp_r)
+        self._ctx = proc
+        self._qjssub_req_r = req_r    # parent reads host-call requests here
+        self._qjssub_resp_w = resp_w  # parent writes host-call responses here
+        self._qjssub_fns = {}
+
+    def _qjssub_dispatch_hostcall(self):
+        import json
+        buf = b""
+        while not buf.endswith(b"\n"):
+            chunk = os.read(self._qjssub_req_r, 65536)
+            if not chunk:
+                raise JSError("qjs_subprocess host-call channel closed unexpectedly")
+            buf += chunk
+        msg = json.loads(buf.decode("utf-8"))
+        name = msg.get("call")
+        fn = self._qjssub_fns.get(name)
+        try:
+            if fn is None:
+                raise JSError("no host function registered for %s" % name)
+            resp = {"result": fn(msg.get("payload"))}
+        except Exception as exc:
+            resp = {"error": str(exc)}
+        os.write(self._qjssub_resp_w, (json.dumps(resp) + "\n").encode("utf-8"))
+
+    def _qjssub_eval(self, code):
+        import json
+        import select
+        p = self._ctx
+        if p.poll() is not None:
+            err = p.stderr.read() if p.stderr else ""
+            raise JSError("qjs_subprocess exited (code %s): %s" % (p.returncode, err))
+        p.stdin.write(json.dumps(code) + "\n")
+        p.stdin.flush()
+        while True:
+            r, _, _ = select.select([p.stdout, self._qjssub_req_r], [], [], 90.0)
+            if not r:
+                raise JSError("qjs_subprocess timed out waiting for a response")
+            if self._qjssub_req_r in r:
+                self._qjssub_dispatch_hostcall()
+                continue
+            line = p.stdout.readline()
+            if not line:
+                err = p.stderr.read() if p.stderr else ""
+                raise JSError("qjs_subprocess closed stdout unexpectedly: %s" % err)
+            msg = json.loads(line)
+            if not msg.get("ok"):
+                raise JSError(msg.get("error") or "unknown qjs_subprocess error")
+            return msg.get("result")
+
+    def _qjssub_register(self, name, fn):
+        self._qjssub_fns[name] = fn
+
+    def _qjssub_call(self, fn_name, *json_args):
+        import json
+        arg_list = ",".join(json_args)
+        code = "JSON.stringify((%s)(%s))" % (fn_name, arg_list)
+        out = self._qjssub_eval(code)
+        return json.loads(out) if out is not None else None
+
+    def _qjssub_run_async(self, deadline_s, max_iter):
+        """Mirrors _qjs_run_async: the engine's own event loop auto-drains the
+        native promise/job queue between dispatches (validated: a .then()
+        scheduled in one eval() call is visible by the next), so no separate
+        drain step is needed here - just poll host_prelude.js's JS-level timer
+        queue and async slot exactly as the in-process quickjs backend does."""
+        import json
+        import time
+        start = time.time()
+        it = 0
+        while True:
+            if (time.time() - start) > deadline_s or it > max_iter:
+                raise JSError("async call timed out after %.1fs (%d iters)"
+                              % (time.time() - start, it))
+            res = json.loads(self._qjssub_eval("__bridge_async_result()"))
+            if res.get("__done"):
+                return res.get("result")
+            if "__error" in res:
+                raise JSError(res["__error"])
+            ran_timer = bool(self._qjssub_eval("__run_one_timer()"))
+            it += 1
+            if not ran_timer:
+                raise JSError("async call stalled: no pending timers "
+                               "but result never settled")
 
     # -- quickjs ----------------------------------------------------------
     def _init_quickjs(self):
@@ -269,6 +408,8 @@ class JSEngine(object):
 
     # -- public api -------------------------------------------------------
     def eval(self, code):
+        if self.backend == "qjs_subprocess":
+            return self._qjssub_eval(code)
         if self.backend == "quickjs":
             return self._qjs_eval(code)
         if self.backend == "js2py":
@@ -277,6 +418,8 @@ class JSEngine(object):
 
     def register(self, name, fn):
         """Expose a Python callable to JS under a global name."""
+        if self.backend == "qjs_subprocess":
+            return self._qjssub_register(name, fn)
         if self.backend == "quickjs":
             return self._qjs_register(name, fn)
         if self.backend == "js2py":
@@ -285,6 +428,8 @@ class JSEngine(object):
 
     def call(self, fn_name, *json_args):
         """Call a global JS function; args are pre-serialized JSON strings."""
+        if self.backend == "qjs_subprocess":
+            return self._qjssub_call(fn_name, *json_args)
         if self.backend == "quickjs":
             return self._qjs_call(fn_name, *json_args)
         if self.backend == "js2py":
@@ -294,15 +439,23 @@ class JSEngine(object):
     def run_async(self, deadline_s=60.0, max_iter=500000):
         """Pump the event loop until a pending async bridge call settles.
 
-        Only the quickjs backend has a real event loop; the others run plugins
-        synchronously, so an async result there is unsupported.
+        Only the qjs_subprocess/quickjs backends have a real event loop; the
+        others run plugins synchronously, so an async result there is
+        unsupported.
         """
+        if self.backend == "qjs_subprocess":
+            return self._qjssub_run_async(deadline_s, max_iter)
         if self.backend == "quickjs":
             return self._qjs_run_async(deadline_s, max_iter)
-        raise JSError("async source methods require the quickjs backend")
+        raise JSError("async source methods require the qjs_subprocess/quickjs backend")
 
     def drain_jobs(self):
-        """Drain any pending promise/microtask jobs (quickjs only; else no-op)."""
+        """Drain any pending promise/microtask jobs.
+
+        quickjs (in-process) needs an explicit pump. qjs_subprocess drains its
+        job queue to exhaustion as part of every dispatch already (validated:
+        a .then() scheduled in one eval() is settled by the next), so there's
+        nothing to do here for it. Other backends: no-op."""
         if self.backend == "quickjs":
             return self._qjs_drain_jobs()
         return 0
@@ -310,12 +463,15 @@ class JSEngine(object):
     def prepare(self, code):
         """Apply backend-specific source fixups before eval.
 
-        quickjs 1.19.4 rejects an escaped hyphen (\\-) inside a /u (unicode)
-        character class, which V8 accepts — so real plugins (e.g. YouTube's
-        bundled JSDOM) fail to parse. Rewrite genuine \\- escapes to \\x2d
-        (the same literal hyphen in both strings and regexes), leaving escaped
-        backslashes (\\\\-) intact. Semantically neutral; only run for quickjs.
+        quickjs 1.19.4 (the in-process Python binding) rejects an escaped
+        hyphen (\\-) inside a /u (unicode) character class, which V8 accepts —
+        so real plugins (e.g. YouTube's bundled JSDOM) fail to parse. Rewrite
+        genuine \\- escapes to \\x2d (the same literal hyphen in both strings
+        and regexes), leaving escaped backslashes (\\\\-) intact. Semantically
+        neutral, so it's applied for qjs_subprocess too even though that
+        engine doesn't appear to need it — cheap insurance against the same
+        class of strictness in a future build.
         """
-        if self.backend != "quickjs":
+        if self.backend not in ("quickjs", "qjs_subprocess"):
             return code
         return _DASH_ESCAPE_RE.sub(_dash_repl, code)
