@@ -66,6 +66,7 @@ def create_group(name):
     groups.append(group)
     _save(groups)
     log("created group %s (%s)" % (group["name"], gid), "info")
+    _notify_changed()
     return group
 
 
@@ -75,6 +76,7 @@ def rename_group(group_id, name):
         if g.get("id") == group_id:
             g["name"] = name
             _save(groups)
+            _notify_changed()
             return True
     return False
 
@@ -86,6 +88,7 @@ def delete_group(group_id):
         return False
     _save(new)
     log("deleted group %s" % group_id, "info")
+    _notify_changed()
     return True
 
 
@@ -137,3 +140,18 @@ def remove_member(group_id, source_id, url):
         return False
     members = [m for m in g.get("members", []) if _key(m) != (source_id, url)]
     return set_members(group_id, members)
+
+
+def _notify_changed():
+    """Best-effort push to any active sync sessions."""
+    try:
+        from ..sync.router_actions import get_service, run_full_sync
+        svc = get_service()
+        if not svc or not svc._sessions:
+            return
+        import threading
+        for sess in list(svc._sessions.values()):
+            threading.Thread(target=run_full_sync, args=(sess,),
+                             daemon=True).start()
+    except Exception:
+        pass

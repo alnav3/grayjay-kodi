@@ -168,6 +168,11 @@ class Router(object):
             ))
         items.append((self.url_for(action="add_source"), "[ Add source… ]", True, ""))
         items.append((self.url_for(action="update_sources"), "[ Check for updates… ]", False, ""))
+        # Sync submenu — only shown when the addon setting is on, so users
+        # who haven't enabled sync don't see an inert entry.
+        from .kodiutils import get_setting
+        if get_setting("sync_enabled", "false") == "true":
+            items.append((self.url_for(action="sync_root"), "[ Sync ]", True, ""))
         self._render(items)
 
     def action_add_source(self):
@@ -989,6 +994,39 @@ class Router(object):
             if h >= best_h and s.get("url"):
                 best, best_h = s.get("url"), h
         return best
+
+    # -- sync -------------------------------------------------------------
+    def action_sync_root(self):
+        from .sync import router_actions as sa
+        self._render(sa.action_root(self))
+
+    def action_sync_show_pairing_url(self):
+        from .sync import router_actions as sa
+        sa.action_show_pairing_url(self)
+
+    def action_sync_pair_url(self):
+        from .sync import router_actions as sa
+        sa.action_pair_url(self)
+
+    def action_sync_devices(self):
+        from .sync import router_actions as sa
+        self._render(sa.action_devices(self))
+
+    def action_sync_now_one(self):
+        from .sync import router_actions as sa
+        sa.action_now_one(self)
+
+    def action_sync_now_all(self):
+        from .sync import router_actions as sa
+        sa.action_now_all(self)
+
+    def action_sync_rename(self):
+        from .sync import router_actions as sa
+        sa.action_rename(self)
+
+    def action_sync_forget(self):
+        from .sync import router_actions as sa
+        sa.action_forget(self)
 
     # -- rendering --------------------------------------------------------
     def _attach_queue(self, items):

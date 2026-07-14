@@ -51,6 +51,7 @@ def add_subscription(source_id, url, name="", thumbnail=""):
                  "name": name or url, "thumbnail": thumbnail})
     _save(subs)
     log("subscribed: %s (%s)" % (name or url, source_id), "info")
+    _notify_changed()
     return True
 
 
@@ -61,4 +62,21 @@ def remove_subscription(source_id, url):
         return False
     _save(new)
     log("unsubscribed: %s (%s)" % (url, source_id), "info")
+    _notify_changed()
     return True
+
+
+def _notify_changed():
+    """Best-effort push to any active sync sessions. Imported lazily so this
+    module doesn't pull in the whole sync stack at import time."""
+    try:
+        from ..sync.router_actions import get_service, run_full_sync
+        svc = get_service()
+        if not svc or not svc._sessions:
+            return
+        import threading
+        for sess in list(svc._sessions.values()):
+            threading.Thread(target=run_full_sync, args=(sess,),
+                             daemon=True).start()
+    except Exception:
+        pass
