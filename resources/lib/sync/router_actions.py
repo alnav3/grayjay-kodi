@@ -168,10 +168,10 @@ def action_now_one(router):
         def _do_connect():
             try:
                 fake_info = {
-                    "public_key": peer,
+                    "publicKey": peer,
                     "addresses": [info["last_address"]],
                     "port": svc.listener_port,
-                    "pairing_code": "",
+                    "pairingCode": "",
                 }
                 svc.connect_and_pair(fake_info, post_auth_callback=_post)
             except Exception as exc:

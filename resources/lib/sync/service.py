@@ -158,17 +158,20 @@ class SyncService:
             return None
         addrs = _local_ips()
         port = self.listener_port
+        # Wire format: camelCase JSON, as expected by Grayjay's SyncDeviceInfo
+        # (kotlinx.serialization with default property names, no @SerialName).
         info = {
-            "public_key": self.public_key_b64,
+            "publicKey": self.public_key_b64,
             "addresses": addrs,
             "port": port,
-            "pairing_code": self.pairing_code,
+            "pairingCode": self.pairing_code,
         }
         body = json.dumps(info, separators=(",", ":")).encode("utf-8")
         return "grayjay://sync/" + base64.urlsafe_b64encode(body).decode("ascii").rstrip("=")
 
     def parse_pairing_url(self, url):
-        """Inverse of get_pairing_url. Returns dict or None."""
+        """Inverse of get_pairing_url. Returns a dict with the wire-format keys
+        (camelCase: publicKey, pairingCode) — see SyncDeviceInfo on Android."""
         if not url or not url.startswith("grayjay://sync/"):
             return None
         try:
@@ -375,16 +378,16 @@ class SyncService:
         """Connect to a peer using a parsed pairing URL. `info` is the dict
         returned by parse_pairing_url(). Triggers pairing flow (no active
         pairing code required — we supply the one from the URL)."""
-        pub_b64 = info.get("public_key")
+        pub_b64 = info.get("publicKey")
         if not pub_b64:
-            raise ValueError("pairing URL missing public_key")
+            raise ValueError("pairing URL missing publicKey")
         try:
             pub = base64.b64decode(pub_b64)
         except Exception:
-            raise ValueError("invalid public_key in pairing URL")
+            raise ValueError("invalid publicKey in pairing URL")
         addrs = info.get("addresses") or []
         port = int(info.get("port") or DEFAULT_PORT)
-        code = info.get("pairing_code") or ""
+        code = info.get("pairingCode") or ""
         if not addrs:
             raise ValueError("pairing URL has no addresses")
         last_err = None
