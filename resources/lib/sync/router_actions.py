@@ -21,14 +21,20 @@ _SINGLETON_LOCK = threading.Lock()
 def get_service():
     """Return the singleton SyncService for this addon, creating it lazily.
 
-    The listener is started on first access if `sync_enabled` is true. Service.py
-    keeps its own reference so the listener survives between router invocations."""
+    The plugin and service processes are separate Kodi Python processes — they
+    don't share this module's globals. Both end up with their own SyncService
+    instance, but both load the same persisted keypair and pairing code from
+    <profile>/sync/, so they present one identity to peers.
+
+    Only the service process should bind the LAN listener. From the plugin
+    process we just prepare (keypair + pairing code); calling start() here
+    would race the service for the port and fail with EADDRINUSE."""
     global _SINGLETON
     with _SINGLETON_LOCK:
         if _SINGLETON is None:
             _SINGLETON = SyncService()
         if get_setting("sync_enabled", "false") == "true" and not _SINGLETON.is_running:
-            _SINGLETON.start()
+            _SINGLETON._ensure_prepared()
         return _SINGLETON
 
 

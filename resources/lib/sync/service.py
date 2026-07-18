@@ -52,7 +52,7 @@ class SyncService:
         self.pairing_code = None
         self.listener_sock = None
         self.listener_thread = None
-        self._running = False
+        self._listener_active = False
         self._lock = threading.Lock()
         self._authorized_callbacks = []  # list of (session) -> None
         self._sessions = {}  # remote_pub_b64 -> SyncSocketSession
@@ -61,6 +61,9 @@ class SyncService:
 
     def _keypair_path(self):
         return os.path.join(self._sync_dir(), "keypair.json")
+
+    def _pairing_code_path(self):
+        return os.path.join(self._sync_dir(), "pairing_code.txt")
 
     def _auth_path(self):
         return os.path.join(self._sync_dir(), "authorized_devices.json")
@@ -92,6 +95,36 @@ class SyncService:
             }, fh)
         log("generated sync keypair (pk=%s...)" % base64.b64encode(pub).decode("ascii")[:8], "info")
         return priv, pub
+
+    def _load_or_create_pairing_code(self):
+        """Persist the active pairing code so the plugin process (which can't
+        bind the listener) shows the same code the service process checks
+        against on incoming handshakes."""
+        p = self._pairing_code_path()
+        if os.path.isfile(p):
+            try:
+                with open(p, "r", encoding="utf-8") as fh:
+                    code = fh.read().strip()
+                if code:
+                    return code
+            except OSError as exc:
+                log("sync pairing code load failed: %s" % exc, "warning")
+        code = _generate_pairing_code()
+        try:
+            with open(p, "w", encoding="utf-8") as fh:
+                fh.write(code)
+        except OSError as exc:
+            log("sync pairing code persist failed: %s" % exc, "warning")
+        return code
+
+    def _ensure_prepared(self):
+        """Idempotent: load keypair + pairing code without binding a socket.
+        Safe to call from the plugin process — it never touches the listener.
+        The service process additionally calls start() to actually bind."""
+        if self.local_priv is None or self.local_pub is None:
+            self.local_priv, self.local_pub = self._load_or_create_keypair()
+        if self.pairing_code is None:
+            self.pairing_code = self._load_or_create_pairing_code()
 
     def _load_authorized(self):
         p = self._auth_path()
@@ -146,12 +179,13 @@ class SyncService:
             return None
 
     def start(self):
-        """Idempotent: starts the keypair, pairing code, and listener."""
+        """Idempotent: prepare keypair/code, then bind the listener socket
+        and start the accept loop. Service-process only — the plugin process
+        should call _ensure_prepared() instead so it doesn't fight for the port."""
         with self._lock:
-            if self._running:
+            if self._listener_active:
                 return
-            self.local_priv, self.local_pub = self._load_or_create_keypair()
-            self.pairing_code = _generate_pairing_code()
+            self._ensure_prepared()
             port = self.listener_port
             try:
                 self.listener_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -163,7 +197,7 @@ class SyncService:
                 log("sync listener bind failed on port %d: %s" % (port, exc), "error")
                 self.listener_sock = None
                 return
-            self._running = True
+            self._listener_active = True
             self.listener_thread = threading.Thread(
                 target=self._listener_loop, name="sync-listener", daemon=True)
             self.listener_thread.start()
@@ -172,9 +206,9 @@ class SyncService:
 
     def stop(self):
         with self._lock:
-            if not self._running:
+            if not self._listener_active:
                 return
-            self._running = False
+            self._listener_active = False
             try:
                 if self.listener_sock:
                     self.listener_sock.close()
@@ -201,12 +235,15 @@ class SyncService:
 
     @property
     def is_running(self):
-        return self._running
+        # The service is "running" from the UI's perspective as soon as it's
+        # prepared (keypair + pairing code), even if no listener is bound
+        # (e.g. the plugin process, which doesn't need one).
+        return self.local_priv is not None and self.pairing_code is not None
 
     # -- listener / acceptor -----------------------------------------------
 
     def _listener_loop(self):
-        while self._running:
+        while self._listener_active:
             try:
                 sock, addr = self.listener_sock.accept()
             except socket.timeout:
