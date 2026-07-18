@@ -84,8 +84,16 @@ class CipherState:
 
 class SymmetricState:
     def __init__(self, protocol_name):
-        if len(protocol_name) <= H_LEN:
-            self.h = bytearray(protocol_name)
+        # Noise §5.2: h = protocol_name, zero-padded to HASHLEN. If the name
+        # is empty, h = HASHLEN zero bytes. If longer than HASHLEN, h = H(name).
+        # The pad-to-HASHLEN rule matters when interoperating with other Noise
+        # implementations (e.g. Grayjay Android) — initializing h to a
+        # shorter buffer diverges from the very first mix_key and every
+        # derived AEAD key fails Poly1305 verification downstream.
+        if not protocol_name:
+            self.h = bytearray(H_LEN)
+        elif len(protocol_name) <= H_LEN:
+            self.h = bytearray(protocol_name) + bytearray(H_LEN - len(protocol_name))
         else:
             self.h = bytearray(BLAKE2b(protocol_name))
         self.ck = bytearray(self.h)
