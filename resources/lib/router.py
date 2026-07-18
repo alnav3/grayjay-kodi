@@ -1081,7 +1081,14 @@ class Router(object):
                 li.setArt({"thumb": thumb, "icon": thumb, "poster": thumb})
             if isinstance(info, dict):
                 self._apply_video_info(li, label, info)
-            if not is_folder:
+            # Only mark as playable when we actually have video metadata. A
+            # non-folder action handler (e.g. action=sync_show_pairing_url,
+            # action=update_sources, action=sync_now_all) is NOT a video —
+            # IsPlayable=true on those routes them through Kodi's Playlist
+            # Player, which doesn't know how to play a plugin:// URL and
+            # logs "Playlist Player: skipping unplayable item" without ever
+            # invoking the action handler.
+            if not is_folder and isinstance(info, dict):
                 li.setProperty("IsPlayable", "true")
             if context:
                 li.addContextMenuItems(context)
