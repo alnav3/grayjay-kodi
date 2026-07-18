@@ -88,3 +88,20 @@ msgstr ""
 msgctxt "#30026"
 msgid "Autoplay next video from the same list (Up Next)"
 msgstr ""
+
+# -- Settings: Sync --
+msgctxt "#30030"
+msgid "Sync"
+msgstr ""
+
+msgctxt "#30031"
+msgid "Enable sync (LAN pairing with other Grayjay devices)"
+msgstr ""
+
+msgctxt "#30032"
+msgid "Device name (shown to paired peers)"
+msgstr ""
+
+msgctxt "#30033"
+msgid "LAN sync port"
+msgstr ""

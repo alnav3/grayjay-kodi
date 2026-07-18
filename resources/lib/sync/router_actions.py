@@ -34,7 +34,7 @@ def get_service():
 
 def action_root(_router):
     """Sync menu: show pairing URL, pair, list devices, sync now, remove."""
-    from .sources import manager
+    from ..sources import manager
     items = []
     items.append(("sync_show_pairing_url", "[ Show pairing URL ]", False, ""))
     items.append(("sync_pair_url", "[ Pair with URL… ]", False, ""))
@@ -90,7 +90,7 @@ def action_pair_url(_router):
         # Send our AUTHORIZED notify.
         id_str = sess.session_id.hex()
         id_bytes = id_str.encode("utf-8")
-        from .sources import manager
+        from ..sources import manager
         device_name = svc.device_name
         name_bytes = device_name.encode("utf-8")
         payload = bytes([len(id_bytes)]) + id_bytes + bytes([len(name_bytes)]) + name_bytes
@@ -235,7 +235,7 @@ def run_full_sync(sess):
     """Push our subscriptions + groups to the peer; pull theirs back.
     Newest-timestamp-wins for each record."""
     import base64
-    from .sources import subscriptions as subs, groups as grp
+    from ..sources import subscriptions as subs, groups as grp
     import json as _json
 
     svc = get_service()
@@ -282,7 +282,7 @@ def run_full_sync(sess):
 
 def _merge_subscriptions(theirs):
     """Merge the peer's subscriptions with ours. Union by (source,url)."""
-    from .sources import subscriptions as subs
+    from ..sources import subscriptions as subs
     ours = subs.list_subscriptions()
     ours_keys = {(s.get("source"), s.get("url")) for s in ours}
     added = 0
@@ -301,7 +301,7 @@ def _merge_subscriptions(theirs):
 
 def _merge_groups(theirs):
     """Merge the peer's groups with ours. Union by group id; members by (source,url)."""
-    from .sources import groups as grp
+    from ..sources import groups as grp
     ours = grp.list_groups()
     ours_by_id = {g.get("id"): g for g in ours}
     added = 0
