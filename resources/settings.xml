@@ -85,7 +85,7 @@
                     <default>false</default>
                     <control type="toggle"/>
                 </setting>
-                <setting id="sync_device_name" type="text" label="30032">
+                <setting id="sync_device_name" type="string" label="30032">
                     <level>0</level>
                     <default>Kodi</default>
                     <constraints>

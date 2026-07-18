@@ -32,14 +32,14 @@ def get_service():
         return _SINGLETON
 
 
-def action_root(_router):
+def action_root(router):
     """Sync menu: show pairing URL, pair, list devices, sync now, remove."""
     from ..sources import manager
     items = []
-    items.append(("sync_show_pairing_url", "[ Show pairing URL ]", False, ""))
-    items.append(("sync_pair_url", "[ Pair with URL… ]", False, ""))
-    items.append(("sync_devices", "[ Paired devices… ]", True, ""))
-    items.append(("sync_now_all", "[ Sync now with all ]", False, ""))
+    items.append((router.url_for(action="sync_show_pairing_url"), "[ Show pairing URL ]", False, ""))
+    items.append((router.url_for(action="sync_pair_url"), "[ Pair with URL… ]", False, ""))
+    items.append((router.url_for(action="sync_devices"), "[ Paired devices… ]", True, ""))
+    items.append((router.url_for(action="sync_now_all"), "[ Sync now with all ]", False, ""))
     return items
 
 
