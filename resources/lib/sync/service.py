@@ -35,7 +35,7 @@ import traceback
 
 from . import session as sync_session
 from .crypto import x25519
-from ..kodiutils import profile_path, get_setting, set_setting, log
+from ..kodiutils import profile_path, get_setting, set_setting, log, notify
 
 
 # Default port. The desktop uses 12315 too (StateSync.cs:263 PORT = 12315).
@@ -278,7 +278,7 @@ class SyncService:
 
     def _handle_incoming(self, sock, addr):
         """Run the responder-side IK handshake, then dispatch to authorized or
-        the user-prompt path."""
+        the prompt path."""
         authorized = self._load_authorized()
         is_allowed = False
         remote_pub = None
@@ -303,40 +303,45 @@ class SyncService:
 
         remote_pub_b64 = base64.b64encode(remote_pub).decode("ascii")
 
-        # Already authorized?
+        # Authorization model:
+        #   1. The pairing code is shown on this Kodi's screen. To reach this
+        #      point the connecting device must present it correctly inside
+        #      the Noise IK handshake — that's already proof of physical
+        #      access. A previously-seen pubkey is also acceptable.
+        #   2. A second click-yes prompt was attempted here in an earlier
+        #      revision via xbmcgui.Dialog().yesno() on a worker thread.
+        #      That call returns False immediately from non-UI threads (or
+        #      deadlocks against the join), making the dialog never visible
+        #      and the connecting device always receives the empty
+        #      `struct.pack("<i",0)` rejection, which the Android app
+        #      surfaces as "session not authorized". Two approvals for the
+        #      same physical-access proof are pointless, so we trust the
+        #      pairing code alone and notify the user instead.
         if remote_pub_b64 in authorized:
             is_allowed = True
+            reason = "already_authorized"
+        elif received_pairing:
+            # `check_pairing` already ran inside respond_ik_handshake — if it
+            # had returned False we'd have raised and not arrived here.
+            is_allowed = True
+            reason = "pairing_code"
+            try:
+                notify("Sync: new device joined from %s" % addr[0])
+            except Exception:
+                pass
         else:
-            # Pairing code matched; prompt user via Kodi dialog (in a worker
-            # thread so the listener loop isn't blocked).
-            decision = {"ok": False}
-
-            def _prompt():
-                try:
-                    import xbmcgui
-                    label = (received_pairing or "")
-                    ok = xbmcgui.Dialog().yesno(
-                        "Authorize sync device",
-                        "A new device wants to sync with this Kodi.\n\n"
-                        "Public key:\n%s...\n\n"
-                        "Pairing code: %s\n\n"
-                        "Authorize?"
-                        % (remote_pub_b64[:16], label))
-                    decision["ok"] = bool(ok)
-                except Exception as exc:
-                    log("auth prompt failed: %s" % exc, "error")
-
-            t = threading.Thread(target=_prompt, daemon=True)
-            t.start()
-            t.join(timeout=120)
-            is_allowed = decision["ok"]
+            is_allowed = False
+            reason = "no_code_or_authorization"
 
         if not is_allowed:
+            log("sync handshake rejected: %s" % reason, "info")
             try:
                 sock.sendall(struct.pack("<i", 0))  # empty handshake reply = reject
             except OSError:
                 pass
             return
+
+        log("sync handshake accepted (%s) from %s" % (reason, addr[0]), "info")
 
         # Add (or refresh) authorized entry.
         authorized[remote_pub_b64] = {
