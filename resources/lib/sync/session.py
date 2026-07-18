@@ -260,6 +260,7 @@ def write_version(sock):
     raw = b""
     while len(raw) < 4:
         chunk = sock.recv(4 - len(raw))
+        log("write_version: recv %d bytes: %s" % (len(chunk), chunk.hex()), "debug")
         if not chunk:
             raise ConnectionError("closed during version exchange")
         raw += chunk
