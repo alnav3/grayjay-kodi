@@ -51,7 +51,9 @@ def action_root(router):
 
 def action_show_pairing_url(_router):
     """Show the grayjay:// pairing URL in a Kodi dialog so the user can copy
-    it to the other device."""
+    it to the other device. The URL is also logged verbatim — base64 chars
+    are easy to mangle by hand-retyping (e.g. K→ee, g→.g) and the strict
+    kotlinx.serialization parser on Android rejects the result."""
     svc = get_service()
     if not svc.is_running:
         if _HAS_KODI:
@@ -62,12 +64,14 @@ def action_show_pairing_url(_router):
     if not url:
         notify("Sync: no pairing URL available")
         return
+    log("sync pairing URL: %s (code=%s)" % (url, svc.pairing_code), "info")
     if _HAS_KODI:
         import xbmcgui
-        xbmcgui.Dialog().ok("Sync pairing URL",
-                            "On the other device, paste this URL into\n"
-                            "the 'Pair with URL' menu.\n\n"
-                            "Pairing code: %s\n\n%s" % (svc.pairing_code, url))
+        xbmcgui.Dialog().ok(
+            "Sync pairing URL",
+            "On the other device, paste this URL into the 'Pair with URL' menu.\n\n"
+            "Copy it character-for-character — base64 is fragile to manual retyping.\n\n"
+            "Pairing code: %s\n\n%s" % (svc.pairing_code, url))
     notify("Pairing code: %s" % svc.pairing_code)
 
 
