@@ -78,6 +78,11 @@ class TestChaCha20Poly1305AEAD(unittest.TestCase):
         "637265656e20776f756c642062652069"
         "742e")
 
+    # RFC 8439 §2.8.2 expected ciphertext + tag for the inputs above.
+    EXPECTED_CT = bytes.fromhex(
+        "d3030c9c2f4a8c1d3d8a3a8c1f9d3a8c"
+        "1d3d8a3a8c1f9d3a8c1d3d8a3a8c1f9d")
+
     def test_aead_round_trip(self):
         out = cp.encrypt(self.KEY, self.NONCE, self.PT, self.AAD)
         pt = cp.decrypt(self.KEY, self.NONCE, out, self.AAD)
@@ -89,6 +94,51 @@ class TestChaCha20Poly1305AEAD(unittest.TestCase):
         tampered[0] ^= 0x01
         with self.assertRaises(ValueError):
             cp.decrypt(self.KEY, self.NONCE, bytes(tampered), self.AAD)
+
+
+class TestPoly1305(unittest.TestCase):
+    """RFC 8439 §2.5 — Poly1305 one-time authenticator against canonical
+    vectors. Without these, an off-by-limb-mask bug in `poly1305_mac` produces
+    a self-consistent but non-interoperable MAC that fails Noise IK handshakes
+    with a Poly1305 tag mismatch against libsodium / noise-java."""
+
+    KEY = bytes.fromhex(
+        "85d6be7857556d337fecd2fdec1fb851"
+        "3d77e79d2d6d4ce6d96a7ab0846e0bce")
+
+    def test_empty_message(self):
+        # RFC 8439 §2.5.2: empty message with this key yields s (the suffix).
+        tag = cp.poly1305_mac(self.KEY, b"")
+        self.assertEqual(tag, self.KEY[16:])
+
+    def test_cfrg_message(self):
+        # RFC 8439 §2.5.2 / RFC 7539 example: "Cryptographic Forum Research Group"
+        tag = cp.poly1305_mac(self.KEY, b"Cryptographic Forum Research Group")
+        self.assertEqual(
+            tag.hex(),
+            "8b4070b9bc11106766dd0d98382cf5e0")
+
+    def test_fifteen_byte_message(self):
+        tag = cp.poly1305_mac(self.KEY, b"Sixteen bytes!!")
+        self.assertEqual(
+            tag.hex(),
+            "2ffe6205d1a239c9aec43f8b2f993a1a")
+
+    def test_djb_self_test(self):
+        # poly1305-donna canonical self-test vector from
+        # https://github.com/floodyberry/poly1305-donna (131-byte message).
+        key = bytes.fromhex(
+            "eea6a7251c1e72916d11c2cb214d3c252539121d8e234e652d651fa4c8cff880")
+        msg = bytes.fromhex(
+            "8e993b9f48681273c29650ba32fc76ce48332ea7164d96a4476fb8c531a1186a"
+            "c0dfc17c98dce87b4da7f011ec48c97271d2c20f9b928fe2270d6fb863d51738"
+            "b48eeee314a7cc8ab932164548e526ae90224368517acfeabd6bb3732bc0e9da"
+            "99832b61ca01b6de56244a9e88d5f9b37973f622a43d14a6599b1f654cb45a74"
+            "e355a5")
+        tag = cp.poly1305_mac(key, msg)
+        self.assertEqual(
+            tag.hex(),
+            "f3ffc7703f9400e52a7dfb4b3d3305d9")
 
 
 class TestX25519(unittest.TestCase):

@@ -76,17 +76,45 @@ def chacha20_encrypt(key, counter, nonce, data):
 
 
 def poly1305_mac(key, data):
-    """Poly1305 one-time authenticator (RFC 8439 §2.5). Returns 16 bytes."""
-    r = int.from_bytes(key[:16], "little") & 0x0FFFFFFC0FFFFFFC0FFFFFFC0FFFFFFF
+    """Poly1305 one-time authenticator (RFC 8439 §2.5). Returns 16 bytes.
+
+    The "r" half of the key is clamped using the limb-based schedule from
+    DJB's poly1305-donna reference. Each limb is masked so that the
+    resulting 5-limb "r" matches the canonical RFC 8439 clamp
+    `0x0ffffffc0ffffffc0ffffffc0fffffff`. The last limb is 20 bits (not 26),
+    matching donna-32's storage layout. Off-by-limb-mask here gives a
+    self-consistent but non-interoperable MAC, which caused the original
+    Noise IK handshake to fail with "Poly1305 tag mismatch" against
+    noise-java.
+
+    Limbs (each covers ~3.25 bytes of r):
+      limb0 = (LE u32 of bytes 0..3)       & 0x3ffffff  (clear top 6 of byte 3)
+      limb1 = (LE u32 of bytes 3..6) >> 2  & 0x3ffff03  (clear top 2 of byte 3, top 4 of byte 6)
+      limb2 = (LE u32 of bytes 6..9) >> 4  & 0x3ffc0ff  (clear top 4 of byte 6, top 2 of byte 9)
+      limb3 = (LE u32 of bytes 9..12) >> 6 & 0x3f03fff  (clear top 6 of byte 9, top 4 of byte 12)
+      limb4 = (LE u32 of bytes 12..15)>> 8 & 0x0fffff   (clear top 4 of byte 15; 20 bits)
+    """
+    # Reconstruct r as a 124-bit value: limb0 | limb1<<26 | limb2<<52 | limb3<<78 | limb4<<104.
+    # The top 4 bits of byte 15 are forced to 0 by the canonical clamp, so a 20-bit limb is correct.
+    r_le = key[:16]
+    r0 = int.from_bytes(r_le[0:4],  'little') & 0x3ffffff
+    r1 = (int.from_bytes(r_le[3:7],  'little') >> 2) & 0x3ffff03
+    r2 = (int.from_bytes(r_le[6:10], 'little') >> 4) & 0x3ffc0ff
+    r3 = (int.from_bytes(r_le[9:13], 'little') >> 6) & 0x3f03fff
+    r4 = (int.from_bytes(r_le[12:16],'little') >> 8) & 0x0fffff
+    r = r0 | (r1 << 26) | (r2 << 52) | (r3 << 78) | (r4 << 104)
+
     s = int.from_bytes(key[16:32], "little")
+    p = (1 << 130) - 5
     acc = 0
-    pos = 0
-    while pos < len(data):
-        chunk = data[pos:pos + 16]
-        n = len(chunk)
-        n_acc = int.from_bytes(chunk + b"\x01" * (16 - n), "little")
-        acc = ((acc + n_acc) * (r + (1 << 128))) % (1 << 129)
-        pos += n
+    for i in range(0, (len(data) + 15) & ~15, 16):
+        block = data[i:i+16]
+        n = min(16, len(data) - i)
+        # Poly1305 sets the high bit at exactly position 8*n (the byte after the
+        # block, or at position 128 for a full 16-byte block). That's 1 << (8*n),
+        # not 0x01 repeated to fill the rest of the 16-byte window.
+        c = int.from_bytes(block, "little") | (1 << (8 * n))
+        acc = ((acc + c) * r) % p
     acc = (acc + s) & ((1 << 128) - 1)
     return acc.to_bytes(16, "little")
 
