@@ -82,10 +82,17 @@ def _start_sync_service():
         return None
     try:
         from resources.lib.sync.router_actions import get_service
+        from resources.lib.sync.router_actions import run_full_sync
         svc = get_service()
+        # Bind the LAN listener. get_service() only loaded keypair + code
+        # (the plugin process needs those too, but never the listener); the
+        # listener is the service process's responsibility.
+        svc.start()
+        if not svc.is_listener_active:
+            log("service: sync listener did not bind; sync will not be reachable", "warning")
+            return None
         # Register a callback that runs the full sync once a connection is
         # authorized, so incoming connections don't sit idle.
-        from resources.lib.sync.router_actions import run_full_sync
         def _on_auth(sess):
             try:
                 run_full_sync(sess)

@@ -237,6 +237,12 @@ class SyncService:
         return get_setting("sync_device_name", "Kodi") or "Kodi"
 
     @property
+    def is_listener_active(self):
+        """True iff the LAN listener socket is bound and accepting. The
+        service process owns this; the plugin process never binds."""
+        return self._listener_active
+
+    @property
     def is_running(self):
         # The service is "running" from the UI's perspective as soon as it's
         # prepared (keypair + pairing code), even if no listener is bound
