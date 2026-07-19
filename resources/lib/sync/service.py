@@ -264,17 +264,18 @@ class SyncService:
             t.start()
 
     def _accept_connection(self, sock, addr):
+        # NOTE: do NOT close the socket in `finally` here. `_handle_incoming`
+        # starts a long-lived `receive_loop` thread that owns this socket
+        # for the duration of the connection; closing it out from under the
+        # loop made every sync request time out 30 s after the handshake
+        # with a silent ECONNRESET. The receive_loop itself closes the
+        # socket via the session's close() when it exits.
         try:
             remote = sync_session.write_version(sock)
             log("sync connect from %s (version %d)" % (addr, remote), "info")
             self._handle_incoming(sock, addr)
         except Exception as exc:
             log("sync accept failed: %s" % exc, "debug")
-        finally:
-            try:
-                sock.close()
-            except OSError:
-                pass
 
     def _handle_incoming(self, sock, addr):
         """Run the responder-side IK handshake, then dispatch to authorized or
@@ -367,15 +368,19 @@ class SyncService:
         sess.send_notify(0, payload)  # NotifyOpcode.AUTHORIZED = 0
         sess.authorized = True
 
-        # Update name from AUTHORIZED reply.
-        def on_data(s, opc, sub, pl):
-            pass  # reserved for sync data
+        # Wire the RecordServer into the receive loop so we can answer the
+        # peer's PUBLISH_RECORD / LIST_RECORD_KEYS / GET_RECORD requests.
+        # Without this, on_data is a no-op and the peer times out waiting
+        # for a response (manifests as "sync request N timed out" 30s after
+        # each handshake, then a stale "session not authorized" error on
+        # the Android side once it gives up on the socket).
+        sync_session.install_record_server(sess, self.local_priv)
 
         def on_close(s):
             self._sessions.pop(remote_pub_b64, None)
 
         threading.Thread(target=sess.receive_loop,
-                         args=(on_data, on_close), daemon=True).start()
+                         args=(None, on_close), daemon=True).start()
 
         for cb in list(self._authorized_callbacks):
             try:

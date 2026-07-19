@@ -173,6 +173,13 @@ class SyncSocketSession:
             log("sync session closed: %s" % exc, "debug")
         finally:
             self._closed = True
+            # We own the socket for the lifetime of the connection — close it
+            # here so the peer sees EOF/RST and `_accept_connection`'s
+            # caller doesn't have to track it.
+            try:
+                self.socket.close()
+            except OSError:
+                pass
             cb = self._on_close
             if cb:
                 try:

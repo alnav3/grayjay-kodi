@@ -96,6 +96,37 @@ def _client_pair(kodi_pub, kodi_priv, code):
         return None, None
 
 
+def _build_full_client_session(svc, a_priv, a_pub, pairing_code):
+    """Initiator side: full Noise IK handshake, then wrap in a
+    SyncSocketSession with receive_loop running. Returns the session."""
+    import socket
+    a_sock = socket.create_connection(("127.0.0.1", _PORT.value), timeout=5)
+    try:
+        sync_session.read_version(a_sock)
+        a_hs, _ = sync_session.initiate_ik_handshake(
+            a_sock, a_priv, svc.local_pub, pairing_code=pairing_code)
+        msg2 = sync_session.initiate_recv_ik_msg2(a_sock)
+        _, a_transport = a_hs.read_message(msg2)
+
+        sess = sync_session.SyncSocketSession(a_sock, "client")
+        sess.local_public_key = a_pub
+        sess.remote_public_key = svc.local_pub
+        sess.transport = a_transport
+        sess.authorized = True
+        sync_session.install_record_server(sess, a_priv)
+        threading.Thread(
+            target=sess.receive_loop,
+            args=(lambda *a: None, lambda *a: None),
+            daemon=True).start()
+        return sess
+    except Exception:
+        try:
+            a_sock.close()
+        except Exception:
+            pass
+        return None
+
+
 _PORT = type("Port", (), {"value": 0})()
 
 
@@ -127,6 +158,7 @@ class SyncAuthTest(unittest.TestCase):
         _StubKodiUtils._settings = {}
         self.svc = sync_service.SyncService()
         self.svc._ensure_prepared()
+        self.svc._sessions = {}  # don't carry sessions across tests
         self._bind_listener()
 
     def _bind_listener(self):
@@ -241,6 +273,40 @@ class SyncAuthTest(unittest.TestCase):
         a_priv, a_pub = x25519.generate_keypair()
         a_sock, a_transport = _client_pair(self.svc.local_pub, a_priv, code="WRONG-CODE")
         self.assertIsNone(a_sock, "wrong code should not have connected")
+
+    def test_record_server_responds_to_peer_publish(self):
+        # Regression: a SyncService session needs install_record_server wired
+        # into the receive loop, otherwise when the peer publishes records
+        # to us, our on_data handler is a no-op and the peer times out
+        # waiting for a response. That manifests in run_full_sync as
+        # "sync request N timed out" 30s after the handshake completes.
+        # With the server installed, a peer PUBLISH_RECORD must round-trip
+        # with status_code=0 within the wait_for_response timeout.
+        a_priv, a_pub = x25519.generate_keypair()
+        sess = _build_full_client_session(
+            self.svc, a_priv, a_pub, pairing_code=self.svc.pairing_code)
+        self.assertIsNotNone(sess)
+
+        b_sess = self._wait_for_some_session(timeout=3.0)
+        self.assertIsNotNone(b_sess)
+
+        import base64
+        peer_b64 = base64.b64encode(self.svc.local_pub).decode("ascii")
+        req_id = sync_session.publish_record(
+            sess, peer_b64, "test_key", b"hello-from-client")
+        try:
+            _req_id, status = sync_session.wait_for_response(
+                sess, req_id,
+                lambda p: sync_session.parse_publish_response(p),
+                timeout=5.0)
+            self.assertTrue(
+                status,
+                "Kodi's record server did not ACK our publish "
+                "(install_record_server missing?)")
+        except TimeoutError:
+            self.fail(
+                "Kodi never replied to PUBLISH_RECORD within 5s: "
+                "install_record_server is missing from the responder path")
 
     def _find_session_by_transport(self, expected):
         for b64, sess in self.svc._sessions.items():
