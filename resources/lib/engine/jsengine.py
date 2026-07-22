@@ -449,6 +449,32 @@ class JSEngine(object):
             return self._qjs_run_async(deadline_s, max_iter)
         raise JSError("async source methods require the qjs_subprocess/quickjs backend")
 
+    def eval_async(self, js_expr, deadline_s=60.0):
+        """Evaluate a JS expression that's expected to return a Promise; pump
+        the event loop until it settles, then return the resolved value.
+
+        Used outside of `source.<method>` when the host has kicked off its
+        own async work (e.g. materialising pending subtitle promises via
+        host_prelude.js's `__await_pending_subs`). Wraps the expression in
+        the same `__async_slot` protocol `__bridge_call` uses for source
+        methods, so the existing event-loop pump picks it up."""
+        import json
+        wrapper = (
+            "(function(){var p=(" + js_expr + ");"
+            "if(p&&typeof p.then==='function'){"
+            "var slot={done:false,value:undefined,error:undefined};"
+            "p.then(function(v){slot.value=v;slot.done=true;},"
+            "function(e){slot.error=(e&&e.message)?e.message:String(e);slot.done=true;});"
+            "globalThis.__async_slot=slot;"
+            "return JSON.stringify({__async:true});}"
+            "return JSON.stringify(JSON.stringify(p));})()"
+        )
+        out = self.eval(wrapper)
+        data = json.loads(out) if out else None
+        if isinstance(data, dict) and data.get("__async"):
+            return self.run_async(deadline_s=deadline_s)
+        return data
+
     def drain_jobs(self):
         """Drain any pending promise/microtask jobs.
 

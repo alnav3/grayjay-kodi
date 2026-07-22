@@ -186,8 +186,9 @@ class PluginBridge(object):
         host_prelude.js materialises `getSubtitles()` synchronously and stashes
         the result as `_subtitles` on the subtitle object before JSON-encoding
         it. Tracks whose `getSubtitles()` returned a Promise (the YouTube ASR
-        botguard branch) are left with `_text=None, url=base_url`; we surface
-        the URL and let the player fetch directly when supported.
+        botguard branch) are stashed as live JS references and awaited here
+        via the engine's async pump, after which the resolved text is copied
+        onto the dict via a second JS-side serialisation.
 
         Tracks that the plugin couldn't materialise are marked `__broken` and
         skipped — otherwise the manifest would advertise a subtitle track
@@ -198,10 +199,14 @@ class PluginBridge(object):
         captions) also have their URL dropped when we have no materialised
         body — without auth they always return 0 bytes regardless of `kind`.
         """
-        out = []
         if not details:
-            return out
-        for sub in (details.get("subtitles") or []):
+            return []
+        # Drain any pending async subtitle promises (e.g. YouTube's ASR
+        # botguard branch). Returns a JSON array mirroring the (now possibly
+        # resolved) live subtitle list on globalThis.__bridge_last_result.
+        merged_subs = self._drain_async_subs(details)
+        out = []
+        for sub in merged_subs:
             if not isinstance(sub, dict):
                 continue
             # Materialisation failed (plugin threw, returned "", or returned a
@@ -229,19 +234,39 @@ class PluginBridge(object):
             })
         return out
 
-
-def _is_gated_captions_url(url):
-    """Endpoints whose subtitle body is gated by auth, so the URL is useless
-    when our addon isn't logged in. The plugin may hand us a perfectly
-    well-formed URL that just returns HTTP 200 / content-length: 0 to us."""
-    if not url:
-        return False
-    u = url.lower()
-    if "youtube.com/api/timedtext" in u or "youtube.com/api/captions" in u:
-        return True
-    if "youtu.be/api/" in u:
-        return True
-    return False
+    def _drain_async_subs(self, details):
+        """If the just-returned details has any __async_subs, await them
+        via the JS engine's async pump and overlay the resolved values
+        onto the dict. Falls back to the JSON-encoded list when the engine
+        has no async support."""
+        import json
+        if not details:
+            return []
+        async_count = sum(1 for s in (details.get("subtitles") or [])
+                          if isinstance(s, dict) and s.get("__async_subs"))
+        if async_count == 0:
+            return details.get("subtitles") or []
+        engine = getattr(self, "engine", None)
+        if engine is None or not hasattr(engine, "eval_async"):
+            # Fall back: surface the URL only. The Python side will drop
+            # auth-gated URLs because no body was materialised.
+            return details.get("subtitles") or []
+        try:
+            raw = engine.eval_async("__await_pending_subs()")
+        except Exception as exc:
+            log("await_pending_subs failed: %s" % exc, "warning")
+            return details.get("subtitles") or []
+        try:
+            resolved = json.loads(raw) if isinstance(raw, (str, bytes)) else raw
+        except (ValueError, TypeError):
+            resolved = []
+        # Overlay the live values onto details.subtitles by index.
+        live = details.get("subtitles") or []
+        if isinstance(resolved, list) and len(resolved) == len(live):
+            for i, fresh in enumerate(resolved):
+                if isinstance(fresh, dict) and isinstance(live[i], dict):
+                    live[i].update(fresh)
+        return live
 
     @staticmethod
     def _default_ua():
@@ -418,3 +443,17 @@ def _is_gated_captions_url(url):
         if isinstance(data, dict) and data.get("__async"):
             return self.engine.run_async(deadline_s=self._async_deadline())
         return data
+
+
+def _is_gated_captions_url(url):
+    """Endpoints whose subtitle body is gated by auth, so the URL is useless
+    when our addon isn't logged in. The plugin may hand us a perfectly
+    well-formed URL that just returns HTTP 200 / content-length: 0 to us."""
+    if not url:
+        return False
+    u = url.lower()
+    if "youtube.com/api/timedtext" in u or "youtube.com/api/captions" in u:
+        return True
+    if "youtu.be/api/" in u:
+        return True
+    return False

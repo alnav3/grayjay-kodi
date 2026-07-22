@@ -210,7 +210,14 @@
     buildVersion: 290, buildSpecVersion: 3, buildFlavor: "stable", buildPlatform: "android",
     isLoggedIn: function () { return false; },
     captchaUserAgent: _UA, authUserAgent: _UA,
-    supportedFeatures: [], supportedContent: [],
+    // "Async" advertises the async source-method shape the YouTube plugin's
+    // BotGuard subtitle path expects (getSubtitles() returns a Promise the
+    // host can await). The plugin still runs BotGuard through our quickjs
+    // engine; we provide a JSDOM shim via dom.js so tryGetEngineBotguard
+    // can construct its window/document globals. Enabling this is what lets
+    // auto-generated YouTube captions fetch their POT-signed body instead
+    // of the no-auth 0-byte reply.
+    supportedFeatures: ["Async"], supportedContent: [],
     hasPackage: function (name) { return ["Http", "Utilities", "DOMParser", "Bridge"].indexOf(name) >= 0; },
     getHardwareCodecs: function () { return []; },
     // Go straight to the host logger. source.js's own log() delegates to
@@ -303,10 +310,16 @@
   // `getSubtitles`, call it and stash the resolved text into a serialisable
   // `_subtitles` field so it survives the trip back to Python.
   //
-  // YouTube's ASR branch can be async (it awaits a BotGuard POT), so await
-  // any Promise the call returns. Returns the input unchanged when there is
-  // nothing to do or materialisation fails for one entry — we never let a
-  // bad subtitle abort an otherwise-successful source method call.
+  // YouTube's ASR branch is async (it awaits a BotGuard POT), so when it
+  // returns a Promise we stash the live object reference in a global array.
+  // The Python host then calls `__await_pending_subs` which pumps the event
+  // loop until all those promises settle, copies the text back onto the
+  // matching subtitle objects (and the live result is held in
+  // __bridge_last_result so the dict in Python gets the up-to-date body).
+  //
+  // Returns the input unchanged when there is nothing to do or materialisation
+  // fails for one entry — we never let a bad subtitle abort an otherwise-
+  // successful source method call.
   function __materialise_subtitles(out) {
     if (!out || !Array.isArray(out.subtitles) || out.subtitles.length === 0) {
       return out;
@@ -319,11 +332,12 @@
       try {
         var text = sub.getSubtitles();
         if (text && typeof text.then === "function") {
-          // Async branch (YouTube ASR w/o POT). We can't await here — the
-          // plugin process pumps the loop in run_async, but this code path
-          // is hit during the synchronous __bridge_call return. Leave a
-          // marker so the Python side can re-enter the engine and await it
-          // explicitly (see bridge.harvest_subtitles).
+          // Async branch (YouTube ASR w/ BotGuard). The plugin is generating
+          // a POT and signing the URL — that needs the event loop to pump
+          // timers. Defer the resolution to __await_pending_subs, but keep
+          // a live reference so we can find the same object again later.
+          if (!global.__pending_subs) global.__pending_subs = [];
+          global.__pending_subs.push({ index: i, ref: sub });
           sub.__async_subs = true;
           continue;
         }
@@ -348,6 +362,37 @@
     return out;
   }
 
+  // Resolves every pending subtitle promise, mutating the held refs in
+  // place so `global.__bridge_last_result.subtitles[i]` reflects the
+  // resolved text. Returns a JSON string of the *current* subtitle list so
+  // the Python side can overlay it onto the dict it already received.
+  global.__await_pending_subs = async function () {
+    if (!global.__pending_subs || global.__pending_subs.length === 0) {
+      return JSON.stringify(global.__bridge_last_result && global.__bridge_last_result.subtitles
+                           ? global.__bridge_last_result.subtitles
+                           : []);
+    }
+    var pending = global.__pending_subs;
+    global.__pending_subs = [];
+    await Promise.all(pending.map(function (entry) {
+      var sub = entry.ref;
+      return Promise.resolve(sub.getSubtitles()).then(function (text) {
+        if (typeof text === "string" && text.length > 0) {
+          sub._subtitles = text;
+        } else {
+          sub.__broken = true;
+        }
+      }, function (e) {
+        global.log("[subtitles] async materialise failed: " +
+                   ((e && e.stack) || e));
+        sub.__broken = true;
+      });
+    }));
+    var subs = (global.__bridge_last_result && global.__bridge_last_result.subtitles)
+               ? global.__bridge_last_result.subtitles : [];
+    return JSON.stringify(subs);
+  };
+
   // ---- plugin entry point (called by Python host) ------------------------
   // Flatten pager objects to plain data; pass everything else through.
   function __encode(out) {
@@ -361,6 +406,9 @@
   // a returned Promise (e.g. YouTube getContentDetails) is stashed and the host
   // pumps the event loop, then collects it via __bridge_async_result().
   global.__async_slot = null;
+  // Keep the live result object around so the host can reach back in via
+  // __await_pending_subs after JSON.stringify has flattened the rest.
+  global.__bridge_last_result = null;
   global.__bridge_call = function (method, argsJson) {
     var args = argsJson ? JSON.parse(argsJson) : [];
     var fn = global.source[method];
@@ -377,6 +425,7 @@
       global.__async_slot = slot;
       return JSON.stringify({ __async: true });
     }
+    global.__bridge_last_result = out;
     __materialise_subtitles(out);
     return JSON.stringify(__encode(out));
   };
