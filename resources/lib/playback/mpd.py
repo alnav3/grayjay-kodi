@@ -123,7 +123,8 @@ def select_formats(usable, max_height=0, adaptive=False):
     return chosen
 
 
-def build_mpd(formats, duration_ms=None, url_map=None, max_height=0, adaptive=False):
+def build_mpd(formats, duration_ms=None, url_map=None, max_height=0,
+              adaptive=False, subtitles=None):
     """Return a DASH MPD string, or None if no usable formats are present.
 
     `formats` is YouTube's adaptiveFormats list. Video/audio are split into
@@ -133,6 +134,11 @@ def build_mpd(formats, duration_ms=None, url_map=None, max_height=0, adaptive=Fa
     BaseURL (used to route media through the loopback range proxy);
     `max_height`/`adaptive` drive representation selection (see
     select_formats).
+
+    `subtitles` (optional) is a list of dicts with `name`, `url`, `format`,
+    `language` and `default` fields. Each becomes a single Representation
+    inside a `text/vtt` AdaptationSet so Kodi/ISA surfaces them on the
+    player's subtitle menu; `default=True` marks one as initially on.
     """
     usable = usable_formats(formats)
     if not usable:
@@ -186,6 +192,10 @@ def build_mpd(formats, duration_ms=None, url_map=None, max_height=0, adaptive=Fa
             'startWithSAP="1">%s</AdaptationSet>' % (
                 set_id, typ, base, "".join(reps)))
 
+    sub_set = _build_subtitle_set(subtitles)
+    if sub_set:
+        sets.append(sub_set)
+
     if not sets:
         return None
 
@@ -195,3 +205,46 @@ def build_mpd(formats, duration_ms=None, url_map=None, max_height=0, adaptive=Fa
         'profiles="urn:mpeg:dash:profile:isoff-on-demand:2011" type="static" '
         'mediaPresentationDuration="%s" minBufferTime="PT1.5S">'
         '<Period>%s</Period></MPD>' % (_duration_iso(duration_ms), "".join(sets)))
+
+
+def _build_subtitle_set(subtitles):
+    """Wrap a list of subtitle dicts into a single DASH AdaptationSet.
+
+    One AdaptationSet holds all tracks because they share a contentType/mimeType
+    and Kodi's ISA UI surfaces them as a single menu the player toggles through.
+    The first track marked `default=True` is the one Kodi turns on initially.
+    """
+    if not subtitles:
+        return None
+    valid = [s for s in subtitles
+             if s and (s.get("url") or s.get("_text"))]
+    if not valid:
+        return None
+    set_id = "subs"
+    reps = []
+    for i, s in enumerate(valid):
+        url = _esc(s.get("url") or "")
+        # id must be unique across the whole MPD; prefix with 'sub' to avoid
+        # colliding with video/audio itags which are numeric. ISA also uses
+        # this as the user-visible label when no <Label> element is given,
+        # so we encode language + a short hint of the display name.
+        lang = (s.get("language") or "und").strip()
+        rid = "sub-%s-%d" % (lang.replace("-", "_"), i + 1)
+        attrs = 'id="%s" bandwidth="256" codecs="wvtt"' % rid
+        # ISA only needs BaseURL; SegmentBase/SegmentTemplate would be needed
+        # for HLS-style segmented subtitles, but a single WebVTT body fits in
+        # one fetch.
+        reps.append(
+            '<Representation %s>'
+            '<BaseURL>%s</BaseURL>'
+            '</Representation>' % (attrs, url))
+    attrs = (
+        'id="%s" contentType="text" mimeType="text/vtt" lang="%s"'
+    ) % (set_id, _esc(valid[0].get("language") or "und"))
+    # Mark the default track on the AdaptationSet level too: some players key
+    # off this rather than the per-Representation flag.
+    return ('<AdaptationSet %s default="%s" subsegmentAlignment="true" '
+            'subsegmentStartsWithSAP="1">%s</AdaptationSet>' % (
+                attrs,
+                "true" if any(s.get("default") for s in valid) else "false",
+                "".join(reps)))

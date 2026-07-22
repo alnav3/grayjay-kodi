@@ -56,6 +56,21 @@
                     <control type="slider" format="integer"/>
                 </setting>
             </group>
+            <group id="2">
+                <setting id="autoload_subtitles" type="boolean" label="30030">
+                    <level>0</level>
+                    <default>true</default>
+                    <control type="toggle"/>
+                </setting>
+                <setting id="preferred_subtitle_language" type="text" label="30031">
+                    <level>0</level>
+                    <default>en</default>
+                    <constraints>
+                        <allowempty>true</allowempty>
+                    </constraints>
+                    <control type="edit" format="string"/>
+                </setting>
+            </group>
         </category>
         <category id="updates" label="30013">
             <group id="1">

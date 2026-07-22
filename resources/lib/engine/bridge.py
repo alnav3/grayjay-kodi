@@ -167,6 +167,46 @@ class PluginBridge(object):
         """Muxed/progressive formats (with direct URLs) — single playable URLs."""
         return self._muxed_harvest
 
+    def harvest_subtitles(self, details):
+        """Extract subtitle tracks from a getContentDetails result.
+
+        Returns a list of dicts with the fields Kodi's DASH manifest needs to
+        advertise a `text/vtt` AdaptationSet per track:
+
+            name      — display label (e.g. "English")
+            url       — direct VTT URL (preferred), or None for tracks whose
+                        content was materialised inline below
+            format    — MIME type the plugin reported (typically "text/vtt")
+            language  — BCP-47 language code (e.g. "en"); may be None
+            _text     — raw VTT body when the plugin had to synthesise the
+                        track (auto-generated YouTube ASR, etc.). The caller
+                        stages this to disk and points `url` at the served
+                        file.
+
+        host_prelude.js materialises `getSubtitles()` synchronously and stashes
+        the result as `_subtitles` on the subtitle object before JSON-encoding
+        it. Tracks whose `getSubtitles()` returned a Promise (the YouTube ASR
+        botguard branch) are left with `_text=None, url=base_url`; we surface
+        the URL and let the player fetch directly when supported.
+        """
+        out = []
+        if not details:
+            return out
+        for sub in (details.get("subtitles") or []):
+            if not isinstance(sub, dict):
+                continue
+            url = sub.get("url") or None
+            text = sub.get("_subtitles") or None
+            fmt = sub.get("format") or "text/vtt"
+            out.append({
+                "name": sub.get("name") or (sub.get("language") or "Subtitle"),
+                "url": None if text else url,
+                "format": fmt,
+                "language": sub.get("language") or None,
+                "_text": text,
+            })
+        return out
+
     @staticmethod
     def _default_ua():
         # Desktop Chrome. Plugins that need a mobile/iOS/Android UA set it

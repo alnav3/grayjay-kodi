@@ -934,6 +934,8 @@ class Router(object):
                                              content_length=content_length,
                                              mime=mime)
 
+        subtitles = self._build_subtitle_entries(bridge, details, port, secret)
+
         dur_ms = 0
         try:
             dur_ms = int((details or {}).get("duration") or 0) * 1000
@@ -942,7 +944,8 @@ class Router(object):
         manifest = mpd_builder.build_mpd(formats, dur_ms or None,
                                          url_map=proxied,
                                          max_height=max_height,
-                                         adaptive=adaptive)
+                                         adaptive=adaptive,
+                                         subtitles=subtitles)
         if not manifest:
             return None
         cache = os.path.join(profile, "cache")
@@ -952,6 +955,92 @@ class Router(object):
         with open(path, "w", encoding="utf-8") as fh:
             fh.write(manifest)
         return "http://127.0.0.1:%d/%s" % (port, os.path.basename(path))
+
+    def _build_subtitle_entries(self, bridge, details, port, secret):
+        """Wrap harvested subtitles into DASH-ready entries.
+
+        Each entry ends up with a `url` that points at the loopback server's
+        /sub/ endpoint — either proxying an upstream URL or serving a body
+        the plugin materialised inline (auto-generated YouTube ASR, etc.).
+        We mark exactly one track as default, preferring the user's preferred
+        language from the `preferred_subtitle_language` setting.
+        """
+        from .playback import manifest_server
+        from .kodiutils import get_setting
+        try:
+            preferred = (get_setting("preferred_subtitle_language", "") or
+                         "").strip().lower()
+        except Exception:
+            preferred = ""
+        try:
+            autoload = get_setting("autoload_subtitles", "true") == "true"
+        except Exception:
+            autoload = True
+
+        harvested = []
+        if hasattr(bridge, "harvest_subtitles"):
+            try:
+                harvested = bridge.harvest_subtitles(details) or []
+            except Exception as exc:
+                log("harvest_subtitles failed: %s" % exc, "debug")
+
+        if not harvested:
+            return []
+
+        def make_entry(s, is_default):
+            mime = s.get("format") or "text/vtt"
+            text = s.get("_text")
+            try:
+                url = manifest_server.subtitle_url(
+                    port, secret,
+                    url=None if text else s.get("url"),
+                    text=text,
+                    mime=mime,
+                    language=s.get("language"),
+                    name=s.get("name"),
+                )
+            except Exception as exc:
+                log("subtitle_url build failed: %s" % exc, "warning")
+                return None
+            return {
+                "name": s.get("name") or s.get("language") or "Subtitle",
+                "url": url,
+                "format": mime,
+                "language": s.get("language") or "",
+                "default": is_default,
+            }
+
+        entries = []
+        default_picked = False
+        # Prefer the user's preferred language if it matches anything.
+        if preferred and autoload:
+            for s in harvested:
+                if (s.get("language") or "").lower().split("-")[0] == preferred:
+                    e = make_entry(s, is_default=True)
+                    if e:
+                        entries.append(e)
+                        default_picked = True
+                    break
+        # Anything not in the preferred branch gets added without default.
+        for s in harvested:
+            if preferred and autoload and default_picked and \
+                    (s.get("language") or "").lower().split("-")[0] == preferred:
+                e = make_entry(s, is_default=False)
+                if e:
+                    entries.append(e)
+                continue
+            e = make_entry(s, is_default=(not default_picked and autoload))
+            if e:
+                entries.append(e)
+            default_picked = default_picked or e.get("default")
+
+        # Keep stable order: defaults first, then by language/name.
+        entries.sort(key=lambda e: (
+            0 if e.get("default") else 1,
+            e.get("language") or "",
+            e.get("name") or "",
+        ))
+        return entries
 
     def _pick_stream(self, details):
         """Pick a directly-playable URL: a real HLS/DASH *manifest* or a muxed

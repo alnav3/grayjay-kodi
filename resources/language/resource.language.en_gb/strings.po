@@ -88,3 +88,11 @@ msgstr ""
 msgctxt "#30026"
 msgid "Autoplay next video from the same list (Up Next)"
 msgstr ""
+
+msgctxt "#30030"
+msgid "Auto-enable subtitles when available"
+msgstr ""
+
+msgctxt "#30031"
+msgid "Preferred subtitle language (ISO code, e.g. en, es, fr; empty for none)"
+msgstr ""

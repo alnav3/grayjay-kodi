@@ -295,6 +295,49 @@
   };
   global.URL.prototype.toString = function () { return this.href; };
 
+  // ---- subtitle materialisation ----------------------------------------
+  // Plugins (notably the YouTube one) return subtitle objects whose text is
+  // produced by a JS function `getSubtitles()` — JSON.stringify would drop the
+  // function and we'd lose the only way to reach the data. Walk the result
+  // after a source method returns; for any subtitle object that exposes
+  // `getSubtitles`, call it and stash the resolved text into a serialisable
+  // `_subtitles` field so it survives the trip back to Python.
+  //
+  // YouTube's ASR branch can be async (it awaits a BotGuard POT), so await
+  // any Promise the call returns. Returns the input unchanged when there is
+  // nothing to do or materialisation fails for one entry — we never let a
+  // bad subtitle abort an otherwise-successful source method call.
+  function __materialise_subtitles(out) {
+    if (!out || !Array.isArray(out.subtitles) || out.subtitles.length === 0) {
+      return out;
+    }
+    for (var i = 0; i < out.subtitles.length; i++) {
+      var sub = out.subtitles[i];
+      if (!sub || typeof sub !== "object") continue;
+      if (typeof sub.getSubtitles !== "function") continue;
+      if (typeof sub._subtitles === "string" && sub._subtitles.length > 0) continue;
+      try {
+        var text = sub.getSubtitles();
+        if (text && typeof text.then === "function") {
+          // Async branch (YouTube ASR w/o POT). We can't await here — the
+          // plugin process pumps the loop in run_async, but this code path
+          // is hit during the synchronous __bridge_call return. Leave a
+          // marker so the Python side can re-enter the engine and await it
+          // explicitly (see bridge.harvest_subtitles).
+          sub.__async_subs = true;
+          continue;
+        }
+        if (typeof text === "string" && text.length > 0) {
+          sub._subtitles = text;
+        }
+      } catch (e) {
+        global.log("[subtitles] materialise failed: " +
+                   ((e && e.stack) || e));
+      }
+    }
+    return out;
+  }
+
   // ---- plugin entry point (called by Python host) ------------------------
   // Flatten pager objects to plain data; pass everything else through.
   function __encode(out) {
@@ -324,6 +367,7 @@
       global.__async_slot = slot;
       return JSON.stringify({ __async: true });
     }
+    __materialise_subtitles(out);
     return JSON.stringify(__encode(out));
   };
 

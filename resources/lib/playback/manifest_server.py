@@ -87,6 +87,21 @@ def _sign(secret, token):
     return hmac.new(secret, token.encode("ascii"), hashlib.sha256).hexdigest()[:32]
 
 
+def _pack_token(payload):
+    """Pack a JSON payload as a URL-safe base64 token (no padding)."""
+    raw = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+    return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+
+
+def _unpack_token(token):
+    """Inverse of _pack_token; returns the decoded dict, or None on bad input."""
+    try:
+        padded = token + "=" * (-len(token) % 4)
+        return json.loads(base64.urlsafe_b64decode(padded).decode("utf-8"))
+    except (ValueError, TypeError):
+        return None
+
+
 def media_url(port, secret, url, content_length=0, mime=""):
     """Build a loopback proxy URL for an upstream media URL.
 
@@ -94,26 +109,76 @@ def media_url(port, secret, url, content_length=0, mime=""):
     packed into a base64url token and signed, so the server needs no shared
     state with the plugin process beyond the key file.
     """
-    payload = json.dumps(
-        {"u": url, "cl": int(content_length or 0), "m": mime or ""},
-        separators=(",", ":"))
-    token = base64.urlsafe_b64encode(payload.encode("utf-8")).decode("ascii").rstrip("=")
+    payload = {"u": url, "cl": int(content_length or 0), "m": mime or ""}
+    token = _pack_token(payload)
     return "http://127.0.0.1:%d/s/%s/%s" % (port, _sign(secret, token), token)
 
 
 def _decode_token(secret, sig, token):
-    """Verify + decode a media token; None if the signature doesn't match."""
+    """Verify + decode a media token; None if the signature doesn't match.
+
+    Media tokens must carry an `u` field pointing at an http(s) URL —
+    anything else is a hostile or malformed payload. Subtitle tokens
+    additionally allow an inline `t` field (raw body) and are decoded
+    by `_decode_subtitle_token` instead."""
     if not hmac.compare_digest(_sign(secret, token), sig):
         return None
-    try:
-        padded = token + "=" * (-len(token) % 4)
-        payload = json.loads(base64.urlsafe_b64decode(padded).decode("utf-8"))
-    except (ValueError, TypeError):
+    payload = _unpack_token(token)
+    if not payload:
         return None
     url = payload.get("u") or ""
     if not url.startswith("https://") and not url.startswith("http://"):
         return None
     return payload
+
+
+def _decode_subtitle_token(secret, sig, token):
+    """Verify + decode a /sub/ token. Either `u` (proxy upstream) or `t`
+    (inline materialised body) must be set; http(s)-only for `u`."""
+    if not hmac.compare_digest(_sign(secret, token), sig):
+        return None
+    payload = _unpack_token(token)
+    if not payload:
+        return None
+    url = payload.get("u")
+    text = payload.get("t")
+    if url is None and text is None:
+        return None
+    if url is not None and not (url.startswith("https://") or
+                                url.startswith("http://")):
+        return None
+    return payload
+
+
+def subtitle_url(port, secret, url=None, text=None, mime="text/vtt",
+                 language=None, name=None):
+    """Build a loopback URL for a subtitle track that ISA will fetch as part
+    of the DASH manifest.
+
+    Two flavours:
+      * url set, text None  — proxy the upstream URL (works for plain VTT
+        endpoints; YouTube's manual `kind=vtt` tracks, etc.). Honours HTTP
+        Range so a long subtitle can be seeked inside the player.
+      * text set, url None  — the plugin materialised the body inline
+        (auto-generated YouTube ASR, etc.). The token carries the raw VTT
+        body; the server returns it directly with no upstream hop.
+
+    Both kinds are signed with the same HMAC key as media URLs so the
+    loopback server only serves what this addon issued.
+    """
+    if (url is None) == (text is None):
+        raise ValueError("subtitle_url needs exactly one of url/text")
+    payload = {
+        "m": mime or "text/vtt",
+        "lang": language or "",
+        "name": name or "",
+    }
+    if url:
+        payload["u"] = url
+    else:
+        payload["t"] = text
+    token = _pack_token(payload)
+    return "http://127.0.0.1:%d/sub/%s/%s" % (port, _sign(secret, token), token)
 
 
 def _parse_range(header):
@@ -163,6 +228,9 @@ def _make_handler(cache_dir, profile_dir):
             if path.startswith("/s/"):
                 self._serve_media(path)
                 return
+            if path.startswith("/sub/"):
+                self._serve_subtitle(path)
+                return
             self._serve_manifest(path)
 
         # -- manifests ----------------------------------------------------
@@ -186,6 +254,130 @@ def _make_handler(cache_dir, profile_dir):
             self.send_header("Content-Length", str(len(data)))
             self.end_headers()
             self.wfile.write(data)
+
+        # -- subtitle proxy --------------------------------------------------
+        def _serve_subtitle(self, path):
+            """Serve a subtitle body — either an inline VTT string (the plugin
+            materialised it via getSubtitles()) or a proxied upstream URL.
+
+            Honours HTTP Range on the inline case too: a player often asks for
+            byte ranges even on small static files, and ISA in particular can
+            issue an open-ended `bytes=N-` request when probing."""
+            parts = path.split("/", 3)  # ['', 'sub', sig, token]
+            if len(parts) != 4 or not parts[2] or not parts[3]:
+                self.send_error(404)
+                return
+            payload = _decode_subtitle_token(proxy_secret(profile_dir),
+                                             parts[2], parts[3])
+            if payload is None:
+                self.send_error(403)
+                return
+
+            mime = payload.get("m") or "text/vtt"
+            inline = payload.get("t")
+
+            if inline is not None:
+                # Inline materialised subtitle body (raw bytes expected).
+                if isinstance(inline, str):
+                    inline = inline.encode("utf-8")
+                self._send_bytes(inline, mime)
+                return
+
+            url = payload.get("u") or ""
+            if not (url.startswith("https://") or url.startswith("http://")):
+                self.send_error(400)
+                return
+
+            # Proxy the upstream URL with Range support (YouTube's timedtext
+            # occasionally honors HTTP Range; the media proxy below does the
+            # same range->googlevideo dance when needed).
+            rng = _parse_range(self.headers.get("Range"))
+            sent_range = None
+            up_headers = {"User-Agent": _UA,
+                          "Accept": "text/vtt,*/*;q=0.5"}
+            if rng:
+                start, end = rng
+                if end is None:
+                    end = ""
+                sep = "&" if "?" in url else "?"
+                url = "%srange=%d-%s" % (url + sep, start, end)
+                sent_range = (start, end)
+            try:
+                code, up, chunks, close = _open_upstream(url, up_headers)
+            except Exception:
+                self.send_error(502)
+                return
+            try:
+                if code not in (200, 206):
+                    close()
+                    self.send_error(code if 400 <= code < 600 else 502)
+                    return
+                length_hdr = up.get("Content-Length")
+                if length_hdr is None:
+                    data = b"".join(chunks)
+                    chunks = (data,)
+                    length = len(data)
+                else:
+                    length = int(length_hdr)
+                content_range = None
+                if sent_range is not None and code == 200:
+                    status = 206
+                    content_range = "bytes %d-%d/%d" % (
+                        sent_range[0],
+                        sent_range[0] + max(length - 1, 0),
+                        length)
+                elif code == 206:
+                    status = 206
+                    content_range = up.get("Content-Range")
+                else:
+                    status = 200
+                self.send_response(status)
+                self.send_header("Content-Type",
+                                 mime or up.get("Content-Type") or
+                                 "text/vtt")
+                self.send_header("Content-Length", str(length))
+                if content_range:
+                    self.send_header("Content-Range", content_range)
+                # Subtitles are tiny and Kodi/ISA sometimes re-fetches the
+                # entire body on every seek. Allow long-lived caching keyed
+                # on the signed URL.
+                self.send_header("Cache-Control", "public, max-age=3600")
+                self.end_headers()
+                for block in chunks:
+                    if block:
+                        self.wfile.write(block)
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                pass
+            finally:
+                try:
+                    close()
+                except Exception:
+                    pass
+
+        def _send_bytes(self, body, mime):
+            """Write a small static body with optional Range support."""
+            total = len(body)
+            rng = _parse_range(self.headers.get("Range"))
+            if rng:
+                start, end = rng
+                if end is None or end >= total:
+                    end = total - 1
+                if start >= total:
+                    self.send_response(416)
+                    self.send_header("Content-Range", "bytes */%d" % total)
+                    self.end_headers()
+                    return
+                body = body[start:end + 1]
+                self.send_response(206)
+                self.send_header("Content-Range",
+                                 "bytes %d-%d/%d" % (start, end, total))
+            else:
+                self.send_response(200)
+            self.send_header("Content-Type", mime)
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "public, max-age=3600")
+            self.end_headers()
+            self.wfile.write(body)
 
         # -- media proxy ----------------------------------------------------
         def _serve_media(self, path):
