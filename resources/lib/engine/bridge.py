@@ -188,6 +188,15 @@ class PluginBridge(object):
         it. Tracks whose `getSubtitles()` returned a Promise (the YouTube ASR
         botguard branch) are left with `_text=None, url=base_url`; we surface
         the URL and let the player fetch directly when supported.
+
+        Tracks that the plugin couldn't materialise are marked `__broken` and
+        skipped — otherwise the manifest would advertise a subtitle track
+        whose URL returns 0 bytes (YouTube's timedtext endpoint without auth,
+        e.g.) and Kodi would show "nothing happens" on selection.
+
+        A few known-auth-gated endpoints (YouTube timedtext, YouTube Music
+        captions) also have their URL dropped when we have no materialised
+        body — without auth they always return 0 bytes regardless of `kind`.
         """
         out = []
         if not details:
@@ -195,8 +204,21 @@ class PluginBridge(object):
         for sub in (details.get("subtitles") or []):
             if not isinstance(sub, dict):
                 continue
+            # Materialisation failed (plugin threw, returned "", or returned a
+            # non-string). Trusting the URL in that state only adds a track
+            # Kodi will show as silent — drop it.
+            if sub.get("__broken"):
+                continue
             url = sub.get("url") or None
             text = sub.get("_subtitles") or None
+            # If we have neither materialised body nor URL, skip.
+            if not text and not url:
+                continue
+            # YouTube timedtext / captions require auth and return 0 bytes
+            # otherwise — when we have no materialised body, the URL is a
+            # trap. Other plugins (PeerTube, Rumble, ...) hand out real URLs.
+            if not text and _is_gated_captions_url(url):
+                continue
             fmt = sub.get("format") or "text/vtt"
             out.append({
                 "name": sub.get("name") or (sub.get("language") or "Subtitle"),
@@ -206,6 +228,20 @@ class PluginBridge(object):
                 "_text": text,
             })
         return out
+
+
+def _is_gated_captions_url(url):
+    """Endpoints whose subtitle body is gated by auth, so the URL is useless
+    when our addon isn't logged in. The plugin may hand us a perfectly
+    well-formed URL that just returns HTTP 200 / content-length: 0 to us."""
+    if not url:
+        return False
+    u = url.lower()
+    if "youtube.com/api/timedtext" in u or "youtube.com/api/captions" in u:
+        return True
+    if "youtu.be/api/" in u:
+        return True
+    return False
 
     @staticmethod
     def _default_ua():

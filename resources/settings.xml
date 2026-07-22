@@ -62,7 +62,7 @@
                     <default>true</default>
                     <control type="toggle"/>
                 </setting>
-                <setting id="preferred_subtitle_language" type="text" label="30031">
+                <setting id="preferred_subtitle_language" type="string" label="30031">
                     <level>0</level>
                     <default>en</default>
                     <constraints>

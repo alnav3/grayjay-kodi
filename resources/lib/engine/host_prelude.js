@@ -329,10 +329,20 @@
         }
         if (typeof text === "string" && text.length > 0) {
           sub._subtitles = text;
+        } else {
+          // Plugin returned an empty/non-string body. Mark it so the Python
+          // side drops the subtitle from the DASH manifest — otherwise ISA
+          // would surface a track that produces zero bytes of VTT.
+          sub.__broken = true;
         }
       } catch (e) {
-        global.log("[subtitles] materialise failed: " +
+        global.log("[subtitles] materialise failed for " +
+                   (sub && sub.name ? sub.name : ("#" + i)) + ": " +
                    ((e && e.stack) || e));
+        // Mark so the manifest drops this track. Without a body and without
+        // a usable URL fallback (YouTube timedtext requires auth), it would
+        // otherwise show up in the subtitle menu and display nothing.
+        sub.__broken = true;
       }
     }
     return out;
