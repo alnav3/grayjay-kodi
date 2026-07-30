@@ -88,6 +88,11 @@ def main():
                 player.tick()
             except Exception as exc:
                 log("service: player tick failed: %s" % exc, "warning")
+        try:
+            from resources.lib.playback import ump_sessions
+            ump_sessions.evict_idle()
+        except Exception as exc:
+            log("service: ump session eviction failed: %s" % exc, "warning")
         # Stagger the first update check so we don't compete with Kodi boot.
         if time.time() - started < _STARTUP_DELAY:
             continue

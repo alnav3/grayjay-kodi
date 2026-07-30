@@ -32,6 +32,8 @@ import os
 import re
 import threading
 
+from . import ump_sessions
+
 try:
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 except ImportError:  # pragma: no cover - Py<3.7
@@ -148,6 +150,49 @@ def _open_upstream(url, headers):
     return getattr(r, "status", r.getcode()), r.headers, chunks(), r.close
 
 
+# -- UMP/SABR fallback manifest -------------------------------------------
+# ump_shim.js's __getUmpManifests returns one DASH MPD per source (see
+# resources/lib/engine/ump_shim.js) -- one <AdaptationSet> for a plain
+# video/audio source, two (video+audio) for a combined muxed source -- each
+# with placeholder media URLs like https://grayjay.internal/audio/internal/
+# segment.mp4?segIndex=$Number$. We splice ALL <AdaptationSet> blocks from
+# every source into one combined manifest and rewrite the placeholder
+# *origin* (not the /video or /audio path -- a combined source's single
+# executor serves both) to point back at this server's
+# /s/ump/<token>/<sourceIndex>/... route.
+_ADAPTATION_SET_RE = re.compile(r"<AdaptationSet\b.*?</AdaptationSet>", re.DOTALL)
+_DURATION_RE = re.compile(r'mediaPresentationDuration="([^"]+)"')
+
+
+def _build_combined_ump_mpd(manifests, port, token):
+    duration = None
+    adaptation_sets = []
+    for i, m in enumerate(manifests):
+        mpd_xml = m.get("mpd") or ""
+        if duration is None:
+            dur_match = _DURATION_RE.search(mpd_xml)
+            if dur_match:
+                duration = dur_match.group(1)
+        replacement = "http://127.0.0.1:%d/s/ump/%s/%d" % (port, token, i)
+        for as_match in _ADAPTATION_SET_RE.finditer(mpd_xml):
+            adaptation_sets.append(
+                as_match.group(0).replace("https://grayjay.internal", replacement))
+    if not adaptation_sets:
+        return None
+    duration = duration or "PT0H10M0S"
+    return (
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<MPD xmlns="urn:mpeg:dash:schema:mpd:2011" '
+        'profiles="urn:mpeg:dash:profile:isoff-live:2011" '
+        'minBufferTime="PT1.5S" type="static" '
+        'mediaPresentationDuration="%s">\n'
+        '  <Period id="0" duration="%s">\n'
+        '    %s\n'
+        '  </Period>\n'
+        '</MPD>\n'
+    ) % (duration, duration, "\n    ".join(adaptation_sets))
+
+
 def _make_handler(cache_dir, profile_dir):
     class Handler(BaseHTTPRequestHandler):
         # Keep-alive matters here: ISA fetches every subsegment as its own
@@ -160,10 +205,89 @@ def _make_handler(cache_dir, profile_dir):
 
         def do_GET(self):
             path = self.path.split("?", 1)[0]
+            if path.startswith("/s/ump/"):
+                self._serve_ump_segment(path)
+                return
             if path.startswith("/s/"):
                 self._serve_media(path)
                 return
             self._serve_manifest(path)
+
+        def do_POST(self):
+            if self.path == "/resolve":
+                self._handle_resolve()
+                return
+            self.send_error(404)
+
+        def _send_json(self, obj, status=200):
+            data = json.dumps(obj).encode("utf-8")
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+        # -- UMP/SABR fallback ---------------------------------------------
+        def _handle_resolve(self):
+            """POST {"source_id", "content_url"} -> {"manifest_url"}. Used by
+            router.py's action_play only when the existing direct-URL/DASH-
+            harvest fallbacks come up empty (see router.py:action_play)."""
+            try:
+                length = int(self.headers.get("Content-Length") or 0)
+                raw = self.rfile.read(length) if length else b""
+                req = json.loads(raw.decode("utf-8")) if raw else {}
+            except Exception:
+                self.send_error(400)
+                return
+            source_id = req.get("source_id")
+            content_url = req.get("content_url")
+            if not source_id or not content_url:
+                self.send_error(400)
+                return
+            session = ump_sessions.create_session(source_id, content_url)
+            if session is None:
+                self._send_json({"error": "no UMP-playable sources"}, 404)
+                return
+            port = self.server.server_address[1]
+            mpd_xml = _build_combined_ump_mpd(
+                session["manifests"], port, session["token"])
+            if mpd_xml is None:
+                self._send_json({"error": "failed to build UMP manifest"}, 500)
+                return
+            name = "ump_%s.mpd" % session["token"]
+            with open(os.path.join(cache_dir, name), "w", encoding="utf-8") as fh:
+                fh.write(mpd_xml)
+            self._send_json({"manifest_url": "http://127.0.0.1:%d/%s" % (port, name)})
+
+        def _serve_ump_segment(self, path):
+            # /s/ump/<token>/<sourceIndex>/<rest...> ; query string (segIndex=N)
+            # comes from self.path since `path` above already stripped it.
+            parts = path.split("/", 5)  # ['', 's', 'ump', token, idx, rest]
+            if len(parts) < 6 or not parts[3] or not parts[4]:
+                self.send_error(404)
+                return
+            token, idx_str, rest = parts[3], parts[4], parts[5]
+            try:
+                source_index = int(idx_str)
+            except ValueError:
+                self.send_error(404)
+                return
+            query = ""
+            if "?" in self.path:
+                query = "?" + self.path.split("?", 1)[1]
+            suffix = "/" + rest + query
+            data = ump_sessions.fetch_segment(token, source_index, suffix)
+            if data is None:
+                self.send_error(502)
+                return
+            try:
+                self.send_response(200)
+                self.send_header("Content-Type", "application/octet-stream")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                pass  # player aborted the request -- normal
 
         # -- manifests ----------------------------------------------------
         def _serve_manifest(self, path):

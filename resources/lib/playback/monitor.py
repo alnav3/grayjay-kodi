@@ -8,17 +8,17 @@ position while the video plays (Kodi reports no position in
 onPlayBackStopped, so polling is the only way to know where the user left
 off), and finalises the entry — History or On Deck — when playback ends.
 A natural end also triggers "Up next": the following item from the directory
-the video was started from.
+the video was started from, played silently (no on-screen notification --
+just the next video starting).
 """
 import time
 
 import xbmc
 
-from ..kodiutils import log, notify, get_setting
+from ..kodiutils import log, get_setting
 from .. import watch
 
 _SAVE_EVERY = 15        # seconds between watch-state writes while playing
-_NEAR_END = 30          # seconds before the end to announce what's next
 # A stream that dies mid-video can still fire onPlayBackEnded; only count an
 # "ended" playback as watched when it actually got near the end.
 _ENDED_WATCHED_FRACTION = 0.8
@@ -35,7 +35,6 @@ class PlayerMonitor(xbmc.Player):
         self._pos = 0.0
         self._total = 0.0
         self._last_save = 0.0
-        self._announced = False
 
     # -- Kodi callbacks (fire on Kodi's threads) ---------------------------
     def onAVStarted(self):
@@ -80,12 +79,6 @@ class PlayerMonitor(xbmc.Player):
             watch.record_progress(cur.get("source"), cur.get("url"),
                                   cur.get("name", ""), cur.get("thumbnail", ""),
                                   self._pos, self._total)
-        if (not self._announced and self._total > 0
-                and (self._total - self._pos) <= _NEAR_END):
-            self._announced = True
-            nxt = self._next_item()
-            if nxt and _autoplay_enabled():
-                notify("Up next: %s" % (nxt.get("name") or "next video"))
 
     # -- internals ------------------------------------------------------------
     def _claim(self):
@@ -96,19 +89,7 @@ class PlayerMonitor(xbmc.Player):
         self._pos = 0.0
         self._total = float(np.get("duration") or 0)
         self._last_save = time.time()
-        self._announced = False
         log("tracking playback: %s" % (np.get("name") or np.get("url")), "info")
-
-    def _next_item(self):
-        cur = self._current or {}
-        qid = cur.get("qid")
-        if not qid:
-            return None
-        try:
-            idx = int(cur.get("idx"))
-        except (TypeError, ValueError):
-            return None
-        return watch.queue_item(qid, idx + 1)
 
     def _finalize(self, ended):
         cur, self._current = self._current, None
@@ -139,5 +120,4 @@ class PlayerMonitor(xbmc.Player):
                     nxt = None
             if nxt and nxt.get("play"):
                 log("up next: %s" % (nxt.get("name") or nxt["play"]), "info")
-                notify("Up next: %s" % (nxt.get("name") or "next video"))
                 xbmc.executebuiltin('PlayMedia("%s")' % nxt["play"])

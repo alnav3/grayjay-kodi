@@ -407,6 +407,29 @@ class JSEngine(object):
         return json.loads(out) if out else None
 
     # -- public api -------------------------------------------------------
+    def close(self):
+        """Release engine resources. Only meaningful for qjs_subprocess
+        (kills the child process and closes the host-call pipes); other
+        backends are in-process and need no explicit teardown. Used by
+        long-lived callers (e.g. the background service's UMP session
+        registry) that hold a JSEngine past a single request."""
+        if self.backend != "qjs_subprocess" or self._ctx is None:
+            return
+        proc = self._ctx
+        try:
+            proc.kill()
+            proc.wait(timeout=2)
+        except Exception:
+            pass
+        for fd in (getattr(self, "_qjssub_req_r", None),
+                   getattr(self, "_qjssub_resp_w", None)):
+            if fd is not None:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+        self._ctx = None
+
     def eval(self, code):
         if self.backend == "qjs_subprocess":
             return self._qjssub_eval(code)

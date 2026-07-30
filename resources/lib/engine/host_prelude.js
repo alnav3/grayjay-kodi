@@ -147,10 +147,27 @@
     this.body = o.body; this.isOk = o.code >= 200 && o.code < 300;
   }
   function Http(useAuth) { this._auth = !!useAuth; }
+  // Binary bodies (e.g. UMP/SABR protobuf requests) can't cross the JSON
+  // host-call boundary as-is -- JSON.stringify turns a Uint8Array into an
+  // index-keyed object, not a byte string. Base64-encode them instead; the
+  // Python side decodes back to raw bytes when bodyIsBase64 is set.
+  function encodeBody(body) {
+    var bytes = null;
+    if (body instanceof Uint8Array) bytes = body;
+    else if (body instanceof ArrayBuffer) bytes = new Uint8Array(body);
+    else if (body && typeof body.byteLength === "number" && body.buffer) {
+      bytes = new Uint8Array(body.buffer, body.byteOffset || 0, body.byteLength);
+    }
+    if (!bytes) return { body: body === undefined ? null : body, bodyIsBase64: false };
+    var bin = "";
+    for (var i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
+    return { body: global.btoa(bin), bodyIsBase64: true };
+  }
   Http.prototype._req = function (method, url, headers, body) {
+    var enc = encodeBody(body);
     return new HttpResponse(hostCall("__host_http", {
       method: method, url: url, headers: headers || {},
-      body: body === undefined ? null : body, useAuth: this._auth,
+      body: enc.body, bodyIsBase64: enc.bodyIsBase64, useAuth: this._auth,
     }));
   };
   Http.prototype.GET = function (url, headers, useAuth) { return this._req("GET", url, headers, null); };
@@ -210,7 +227,12 @@
     buildVersion: 290, buildSpecVersion: 3, buildFlavor: "stable", buildPlatform: "android",
     isLoggedIn: function () { return false; },
     captchaUserAgent: _UA, authUserAgent: _UA,
-    supportedFeatures: [], supportedContent: [],
+    // "Async" tells plugins they can rely on real Promise/setTimeout
+    // scheduling (this engine has both, driven by run_async()/drain_jobs()
+    // in jsengine.py -- see e.g. the YouTube plugin's UMP backoff-and-retry
+    // logic, which otherwise falls through to a synchronous failure path
+    // instead of properly waiting and retrying).
+    supportedFeatures: ["Async"], supportedContent: [],
     hasPackage: function (name) { return ["Http", "Utilities", "DOMParser", "Bridge"].indexOf(name) >= 0; },
     getHardwareCodecs: function () { return []; },
     // Go straight to the host logger. source.js's own log() delegates to

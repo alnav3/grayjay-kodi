@@ -33,6 +33,15 @@ _DIR = os.path.dirname(os.path.abspath(__file__))
 HOST_PRELUDE_JS = os.path.join(_DIR, "host_prelude.js")  # host-injected packages
 SOURCE_JS = os.path.join(_DIR, "source.js")              # Grayjay's own SDK prelude
 DOM_JS = os.path.join(_DIR, "dom.js")                    # domParser package
+UMP_SHIM_JS = os.path.join(_DIR, "ump_shim.js")          # YouTube UMP/SABR fallback shim
+
+# Hosts whose requests are small, fast JSON round-trips (not large/streamed
+# content) where an automatic retry costs almost nothing -- safe to retry
+# blindly. YouTube's own endpoints (player.js, googlevideo segments, etc.)
+# are deliberately excluded: those can legitimately take tens of seconds
+# (see _read_capped), and retrying one from scratch on a slow home-WiFi
+# blip would multiply, not fix, the delay a user feels.
+_RETRYABLE_HOSTS = ("solver.grayjay.app", "solutions.grayjay.app")
 
 
 class SignatureError(Exception):
@@ -85,11 +94,77 @@ class PluginBridge(object):
                     results[i] = fut.result()
         return json.dumps({"responses": results})
 
+    def _decode_response_body(self, raw_bytes):
+        """Text responses (JSON/HTML/etc.) must stay plain strings -- lots of
+        existing plugin code does `JSON.parse(resp.body)` directly. Binary
+        responses (e.g. UMP/SABR segment bytes) aren't valid UTF-8, so a
+        strict decode attempt fails and we base64-encode instead; the JS side
+        already treats a string `resp.body` it can't JSON.parse as base64
+        (`Uint8Array.from(atob(data), ...)`, script.js:4501) -- this is the
+        same contract Grayjay's native host uses for binary bodies."""
+        try:
+            return raw_bytes.decode("utf-8")
+        except UnicodeDecodeError:
+            return base64.b64encode(raw_bytes).decode("ascii")
+
+    @staticmethod
+    def _read_capped(fileobj, max_seconds=45.0, chunk_size=65536):
+        """r.read() with no size argument blocks until the socket hits true
+        EOF -- fine for an ordinary bounded response, but some googlevideo
+        endpoints (`keepalive=yes` in the query string -- part of YouTube's
+        UMP/SABR streaming protocol) hold the connection open and keep
+        trickling bytes indefinitely, resetting urllib's per-read timeout
+        each time without ever sending EOF. Read in chunks and stop once
+        max_seconds of wall-clock time have passed regardless of whether the
+        connection is still open, treating whatever arrived as the full
+        response. 45s was picked empirically: the UMP/SABR combined-source
+        endpoint's real (bounded) response can legitimately take 30-40s to
+        arrive server-side (looks like BotGuard/attestation verification
+        delay, not a stall) -- a 20s cap cut it off just short of success in
+        testing, so this only ever cuts off responses that genuinely never
+        finish, not slow-but-real ones."""
+        import time as _time
+        start = _time.monotonic()
+        chunks = []
+        while _time.monotonic() - start < max_seconds:
+            chunk = fileobj.read(chunk_size)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        return b"".join(chunks)
+
     def _do_http(self, data):
+        """Transient network blips (a dropped connection, a 5xx/429) hitting
+        the small, fast solver-cache endpoints are common on this box's WiFi,
+        but plugin code often treats a single failed request as fatal for the
+        whole operation (e.g. the YouTube source's N-parameter solver lookup
+        has no retry/catch, unlike its signature-solver counterpart -- one bad
+        response aborts cipher prep entirely). Retry a couple of times with a
+        short backoff before handing a failure back to JS, so we only ever
+        surface a real, persistent failure. Scoped to _RETRYABLE_HOSTS only --
+        see its docstring for why large/streamed content fetches must not be
+        retried the same way."""
+        url = data.get("url") or ""
+        if not any(host in url for host in _RETRYABLE_HOSTS):
+            return self._do_http_once(data)
+        import time as _time
+        last = None
+        for attempt in range(3):
+            last = self._do_http_once(data)
+            code = last.get("code") or 0
+            retryable = code == 0 or code == 429 or code >= 500
+            if not retryable or attempt == 2:
+                return last
+            _time.sleep(0.4 * (attempt + 1))
+        return last
+
+    def _do_http_once(self, data):
         method = (data.get("method") or "GET").upper()
         url = data.get("url")
         headers = data.get("headers") or {}
         body = data.get("body")
+        if body and data.get("bodyIsBase64"):
+            body = base64.b64decode(body)
         # allowUrls enforcement (basic): if config restricts domains, honor it.
         if not self.config.url_allowed(url):
             return {"url": url, "code": 0, "headers": {}, "body": "",
@@ -108,27 +183,45 @@ class PluginBridge(object):
             if _requests is not None:
                 resp = _requests.request(method, url, headers=headers,
                                          data=body, timeout=20, allow_redirects=True,
-                                         verify=_CA_BUNDLE)
-                self._harvest_streams(url, resp.status_code, resp.text)
+                                         verify=_CA_BUNDLE, stream=True)
+                # See _read_capped: some googlevideo endpoints (keepalive=yes)
+                # hold the connection open indefinitely -- resp.content would
+                # block forever waiting for it to close.
+                import time as _time
+                start = _time.monotonic()
+                chunks = []
+                for chunk in resp.iter_content(chunk_size=65536):
+                    if chunk:
+                        chunks.append(chunk)
+                    if _time.monotonic() - start >= 45.0:
+                        break
+                raw_bytes = b"".join(chunks)
+                body_out = self._decode_response_body(raw_bytes)
+                self._harvest_streams(url, resp.status_code,
+                                      raw_bytes.decode("utf-8", "replace"))
                 return {
                     "url": resp.url, "code": resp.status_code,
-                    "headers": dict(resp.headers), "body": resp.text,
+                    "headers": dict(resp.headers), "body": body_out,
                 }
             req = _urlreq.Request(url, method=method, headers=headers,
-                                  data=body.encode("utf-8") if body else None)
+                                  data=body if isinstance(body, bytes)
+                                  else (body.encode("utf-8") if body else None))
             try:
                 r = _urlreq.urlopen(req, timeout=20)
             except _urlreq.HTTPError as he:
                 # Non-2xx: return the response rather than raising, so the
                 # plugin can inspect status/body (e.g. to detect captchas).
-                body_txt = he.read().decode("utf-8", "replace") if hasattr(he, "read") else ""
+                raw = self._read_capped(he) if hasattr(he, "read") else b""
+                body_txt = self._decode_response_body(raw)
                 return {"url": url, "code": he.code,
                         "headers": dict(he.headers or {}), "body": body_txt}
             with r:
-                raw = r.read().decode("utf-8", "replace")
-                self._harvest_streams(url, r.status, raw)
+                raw_bytes = self._read_capped(r)
+                body_out = self._decode_response_body(raw_bytes)
+                self._harvest_streams(url, r.status,
+                                      raw_bytes.decode("utf-8", "replace"))
                 return {"url": r.geturl(), "code": r.status,
-                        "headers": dict(r.headers), "body": raw}
+                        "headers": dict(r.headers), "body": body_out}
         except Exception as exc:
             log("http error %s: %s" % (url, exc), "warning")
             return {"url": url, "code": 0, "headers": {}, "body": "", "error": str(exc)}
@@ -263,6 +356,8 @@ class PluginBridge(object):
                 self.engine.eval(fh.read())
         with open(SOURCE_JS, "r", encoding="utf-8") as fh:
             source_sdk = fh.read()
+        with open(UMP_SHIM_JS, "r", encoding="utf-8") as fh:
+            ump_shim = fh.read()
         # Apply engine-specific fixups (e.g. quickjs \- in /u classes) to the
         # SDK and plugin code. Signature was verified above on the original
         # bytes; this only adapts the code for our JS engine.
@@ -272,6 +367,7 @@ class PluginBridge(object):
                 json.dumps(self.config.raw), json.dumps(self.settings)),
             self.engine.prepare(script),
             "globalThis.source = source; globalThis.plugin = plugin; globalThis.Type = Type;",
+            ump_shim,
         ])
         self.engine.eval(combined)
         self._loaded = True
@@ -342,3 +438,33 @@ class PluginBridge(object):
         if isinstance(data, dict) and data.get("__async"):
             return self.engine.run_async(deadline_s=self._async_deadline())
         return data
+
+    def close(self):
+        """Tear down the underlying JS engine (kills the qjs subprocess, if
+        any). Only needed by long-lived holders of a bridge (e.g. the
+        service's UMP session registry) -- ephemeral per-request bridges
+        just get garbage collected with the process."""
+        self.engine.close()
+
+
+def create_enabled_bridge(source_id):
+    """Look up a source's config and return a ready-to-call PluginBridge, or
+    None if the source doesn't exist. Feeds back the plugin's persisted
+    saveState() so a fresh process doesn't redo expensive session init
+    (YouTube: innertube context + BotGuard) on every invocation, and persists
+    it again afterwards. Shared by router.py's per-request bridge cache and
+    the background service's UMP session registry."""
+    from ..sources import manager, plugin_settings, plugin_state
+    cfg = manager.get_source(source_id)
+    if cfg is None:
+        return None
+    bridge = PluginBridge(cfg)
+    bridge.enable(settings=plugin_settings.load(cfg),
+                  saved_state=plugin_state.load(cfg) or None)
+    try:
+        state = bridge.save_state()
+        if state:
+            plugin_state.save(cfg, state)
+    except Exception as exc:
+        log("persisting state failed: %s" % exc, "debug")
+    return bridge

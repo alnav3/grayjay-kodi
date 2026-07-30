@@ -102,19 +102,8 @@ class Router(object):
             cache = self._bridges = {}
         if source_id in cache:
             return cache[source_id]
-        from .sources import manager, plugin_settings, plugin_state
-        from .engine.bridge import PluginBridge
-        cfg = manager.get_source(source_id)
-        if cfg is None:
-            cache[source_id] = None
-            return None
-        bridge = PluginBridge(cfg)
-        # Feed back the plugin's persisted saveState() so a fresh Kodi plugin
-        # process doesn't redo expensive session init (YouTube: innertube
-        # context + BotGuard) on every single invocation.
-        bridge.enable(settings=plugin_settings.load(cfg),
-                      saved_state=plugin_state.load(cfg) or None)
-        self._persist_state(bridge)
+        from .engine.bridge import create_enabled_bridge
+        bridge = create_enabled_bridge(source_id)
         cache[source_id] = bridge
         return bridge
 
@@ -845,7 +834,56 @@ class Router(object):
                 log("would play muxed: %s" % muxed_url, "info")
             return
 
+        # Last resort: some videos fail Android/Android-VR/iOS player-response
+        # verification (e.g. "no audio streams") and the plugin itself falls
+        # back to YouTube's UMP/SABR protocol, which has no static per-segment
+        # URL to harvest above -- it's a stateful, chunked conversation that
+        # must stay alive for the whole playback. That can't live in this
+        # short-lived process (see _handoff_now_playing below), so ask the
+        # persistent background service to resolve it instead.
+        manifest_url = self._resolve_ump(source_id, content_url)
+        if manifest_url:
+            self._handoff_now_playing(source_id, content_url, details)
+            if _HAS_KODI:
+                li = xbmcgui.ListItem(path=manifest_url)
+                li.setMimeType("application/dash+xml")
+                li.setContentLookup(False)
+                li.setProperty("inputstream", "inputstream.adaptive")
+                xbmcplugin.setResolvedUrl(self.handle, True, li)
+            else:
+                log("would play UMP manifest: %s" % manifest_url, "info")
+            return
+
         notify("No playable stream found")
+
+    def _resolve_ump(self, source_id, content_url):
+        """POST to the background service's /resolve endpoint (see
+        resources/lib/playback/manifest_server.py); returns a manifest URL, or
+        None if the service is unavailable or the video has nothing playable
+        via UMP either."""
+        import json
+        import urllib.request
+        from .playback import manifest_server
+        from .kodiutils import profile_path
+
+        port = manifest_server.published_port(profile_path())
+        if not port:
+            return None
+        body = json.dumps({"source_id": source_id, "content_url": content_url}).encode("utf-8")
+        req = urllib.request.Request(
+            "http://127.0.0.1:%d/resolve" % port, data=body,
+            headers={"Content-Type": "application/json"}, method="POST")
+        try:
+            # UMP resolution can legitimately take up to ~2 x ump_sessions.
+            # _CALL_TIMEOUT_S (a couple of retries, each bounded) -- give it
+            # real headroom rather than giving up early on a slow-but-working
+            # resolution.
+            with urllib.request.urlopen(req, timeout=260) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+        except Exception as exc:
+            log("ump resolve failed for %s: %s" % (content_url, exc), "warning")
+            return None
+        return data.get("manifest_url")
 
     def _handoff_now_playing(self, source_id, content_url, details):
         """Leave the background service a note about what is about to play so
