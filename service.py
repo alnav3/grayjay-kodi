@@ -93,6 +93,11 @@ def main():
             ump_sessions.evict_idle()
         except Exception as exc:
             log("service: ump session eviction failed: %s" % exc, "warning")
+        try:
+            from resources.lib.playback import session_registry
+            session_registry.evict_idle()
+        except Exception as exc:
+            log("service: session registry eviction failed: %s" % exc, "warning")
         # Stagger the first update check so we don't compete with Kodi boot.
         if time.time() - started < _STARTUP_DELAY:
             continue
@@ -102,6 +107,11 @@ def main():
             _mark_run(time.time())
     if manifest_srv:
         manifest_srv.shutdown()
+    try:
+        from resources.lib.playback import session_registry
+        session_registry.evict_idle(max_age=0)  # kill every warm bridge on shutdown
+    except Exception as exc:
+        log("service: session registry shutdown cleanup failed: %s" % exc, "warning")
     log("service stopped", "info")
 
 

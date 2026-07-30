@@ -70,6 +70,58 @@ def _fmt_datetime(unix_seconds):
         return ""
 
 
+class RemoteBridge(object):
+    """Drop-in stand-in for a local PluginBridge that instead runs every call
+    on the background service's warm, long-lived bridge for this source (see
+    resources/lib/playback/session_registry.py) -- so the expensive BotGuard/
+    session cold-start happens once per service lifetime, not once per Kodi
+    plugin invocation. Exposes just what router.py's play/browse paths use:
+    .config, .call(), .harvested_streams()/.harvested_muxed(), .save_state()."""
+
+    # Generous: must outlast session_registry's own _CALL_TIMEOUT_S (150s)
+    # plus HTTP/JSON overhead, so a legitimately slow cold-start on the
+    # service side isn't cut off early by this end.
+    _HTTP_TIMEOUT_S = 170
+
+    def __init__(self, source_id, config, port):
+        self.source_id = source_id
+        self.config = config
+        self._port = port
+        self._stream_harvest = []
+        self._muxed_harvest = []
+
+    def call(self, method, args):
+        import json
+        import urllib.request
+        import urllib.error
+
+        body = json.dumps({
+            "source_id": self.source_id, "method": method, "args": args,
+        }).encode("utf-8")
+        req = urllib.request.Request(
+            "http://127.0.0.1:%d/session/call" % self._port, data=body,
+            headers={"Content-Type": "application/json"}, method="POST")
+        try:
+            with urllib.request.urlopen(req, timeout=self._HTTP_TIMEOUT_S) as resp:
+                out = json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as he:
+            out = json.loads(he.read().decode("utf-8"))
+            raise RuntimeError(out.get("error") or ("HTTP %d" % he.code))
+        self._stream_harvest = out.get("stream_harvest") or []
+        self._muxed_harvest = out.get("muxed_harvest") or []
+        return out.get("result")
+
+    def harvested_streams(self):
+        return self._stream_harvest
+
+    def harvested_muxed(self):
+        return self._muxed_harvest
+
+    @staticmethod
+    def save_state():
+        return None  # the service persists state itself; nothing to do here
+
+
 class Router(object):
     def __init__(self, argv):
         self.base_url = argv[0]
@@ -95,15 +147,32 @@ class Router(object):
 
     # -- bridge reuse -----------------------------------------------------
     def _bridge(self, source_id):
-        """Return an enabled PluginBridge for a source, cached per request so
-        aggregating many channels from one source only parses its JS once."""
+        """Return a bridge for a source, cached per request so aggregating
+        many channels from one source only does this lookup once.
+
+        Prefers a RemoteBridge backed by the background service's warm,
+        long-lived PluginBridge (see session_registry.py) -- the expensive
+        BotGuard/session cold-start then happens once per service lifetime
+        instead of once per Kodi plugin invocation. Falls back to a fresh
+        local PluginBridge (today's behavior) only if the service isn't up."""
         cache = getattr(self, "_bridges", None)
         if cache is None:
             cache = self._bridges = {}
         if source_id in cache:
             return cache[source_id]
-        from .engine.bridge import create_enabled_bridge
-        bridge = create_enabled_bridge(source_id)
+        from .sources import manager
+        cfg = manager.get_source(source_id)
+        if cfg is None:
+            cache[source_id] = None
+            return None
+        from .playback import manifest_server
+        from .kodiutils import profile_path
+        port = manifest_server.published_port(profile_path())
+        if port:
+            bridge = RemoteBridge(source_id, cfg, port)
+        else:
+            from .engine.bridge import create_enabled_bridge
+            bridge = create_enabled_bridge(source_id)
         cache[source_id] = bridge
         return bridge
 

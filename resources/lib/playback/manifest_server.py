@@ -32,7 +32,7 @@ import os
 import re
 import threading
 
-from . import ump_sessions
+from . import session_registry, ump_sessions
 
 try:
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -217,7 +217,38 @@ def _make_handler(cache_dir, profile_dir):
             if self.path == "/resolve":
                 self._handle_resolve()
                 return
+            if self.path == "/session/call":
+                self._handle_session_call()
+                return
             self.send_error(404)
+
+        # -- warm per-source bridge (see session_registry.py) ---------------
+        def _handle_session_call(self):
+            """POST {"source_id", "method", "args"} -> {"result", ...}. Runs
+            the call on a warm, long-lived bridge instead of the short-lived
+            plugin process cold-starting its own (see router.py:_bridge)."""
+            try:
+                length = int(self.headers.get("Content-Length") or 0)
+                raw = self.rfile.read(length) if length else b""
+                req = json.loads(raw.decode("utf-8")) if raw else {}
+            except Exception:
+                self.send_error(400)
+                return
+            source_id = req.get("source_id")
+            method = req.get("method")
+            args = req.get("args") or []
+            if not source_id or not method:
+                self.send_error(400)
+                return
+            try:
+                out = session_registry.call(source_id, method, args)
+            except LookupError:
+                self._send_json({"error": "source not found"}, 404)
+                return
+            except Exception as exc:
+                self._send_json({"error": str(exc)}, 502)
+                return
+            self._send_json(out)
 
         def _send_json(self, obj, status=200):
             data = json.dumps(obj).encode("utf-8")
