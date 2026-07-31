@@ -956,10 +956,12 @@ class Router(object):
 
     def _handoff_now_playing(self, source_id, content_url, details):
         """Leave the background service a note about what is about to play so
-        it can track watch progress and queue "Up next" — this process exits
-        right after setResolvedUrl and can't observe the player itself."""
+        it can track watch progress, skip SponsorBlock segments, and queue
+        "Up next" — this process exits right after setResolvedUrl and can't
+        observe the player itself."""
         try:
             from . import watch
+            from .playback import sponsorblock
             qid = self.args.get("qid", "")
             idx = self.args.get("idx", "")
             d = details or {}
@@ -975,11 +977,27 @@ class Router(object):
                     name = name or qi.get("name", "")
                     thumb = thumb or qi.get("thumbnail", "")
                     duration = duration or qi.get("duration") or 0
-            watch.set_now_playing({
+            # SponsorBlock: extract per-category actions from plugin settings
+            # so the background service monitor can skip/prompt segments
+            # without needing to re-load the source config.
+            sb_categories = {}
+            try:
+                from .sources import manager, plugin_settings
+                cfg = manager.get_source(source_id)
+                if cfg:
+                    all_settings = plugin_settings.load(cfg)
+                    sb_categories = sponsorblock._categories_from_settings(
+                        all_settings)
+            except Exception:
+                pass
+            payload = {
                 "source": source_id, "url": content_url, "name": name,
                 "thumbnail": thumb, "duration": duration,
                 "qid": qid, "idx": idx,
-            })
+            }
+            if sb_categories:
+                payload["sb_categories"] = sb_categories
+            watch.set_now_playing(payload)
         except Exception as exc:
             log("now-playing handoff failed: %s" % exc, "debug")
 
