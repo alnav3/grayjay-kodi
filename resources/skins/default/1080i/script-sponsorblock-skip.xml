@@ -2,6 +2,7 @@
 <!-- SponsorBlock skip segment OSD overlay button -->
 <window>
 	<defaultcontrol always="true">3012</defaultcontrol>
+	<onload>Dialog.Close(fullscreeninfo,true)</onload>
 	<controls>
 		<control type="group">
 			<animation type="WindowOpen" reversible="false">
