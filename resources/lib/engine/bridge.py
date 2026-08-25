@@ -11,6 +11,7 @@ import base64
 import hashlib
 import json
 import os
+import re
 import uuid
 
 from ..kodiutils import log, resolve_ca_bundle
@@ -56,6 +57,7 @@ class PluginBridge(object):
         self.settings = {}             # per-source plugin settings (by variable)
         self._stream_harvest = []      # adaptive formats sniffed from responses
         self._muxed_harvest = []       # muxed (progressive) formats sniffed
+        self._caption_harvest = []     # subtitle/caption tracks sniffed
         from .dom import DOMRegistry
         self._dom = DOMRegistry()
 
@@ -227,7 +229,8 @@ class PluginBridge(object):
             return {"url": url, "code": 0, "headers": {}, "body": "", "error": str(exc)}
 
     def _harvest_streams(self, url, code, body):
-        """Sniff direct-URL adaptive formats from a YouTube player response.
+        """Sniff direct-URL adaptive formats + caption tracks from a YouTube
+        player response.
 
         The plugin returns adaptive sources to us with deciphered *video* URLs
         but no audio URLs (audio is meant to be muxed JS-side via SABR). The raw
@@ -235,7 +238,12 @@ class PluginBridge(object):
         range-able URLs for *both* video and audio — exactly what we need to
         synthesise a DASH manifest for inputstream.adaptive. Capture the last
         such set so the router can build an MPD for playback. Best-effort and
-        YouTube-shaped; harmless (and inert) for other sources."""
+        YouTube-shaped; harmless (and inert) for other sources.
+
+        Captions: `captions.playerCaptionsTracklistRenderer.captionTracks`
+        carries one entry per language (auto-generated + manual). Each has a
+        `baseUrl` that returns WebVTT when `&fmt=vtt` is appended. We rewrite
+        to that form so inputstream.adaptive can consume them directly."""
         if code != 200 or "youtubei/v1/player" not in (url or ""):
             return
         try:
@@ -251,6 +259,42 @@ class PluginBridge(object):
             self._stream_harvest = fmts
             self._muxed_harvest = [f for f in (sd.get("formats") or [])
                                    if f.get("url")]
+            self._caption_harvest = self._extract_captions(data)
+
+    @staticmethod
+    def _extract_captions(data):
+        """Pull caption tracks from a YouTube player response.
+
+        Returns a list of dicts with `url`, `lang`, `name`, `auto` keys, or
+        [] if there are no captions. `auto=True` for ASR (auto-generated)
+        tracks, False for uploader-supplied ones — Kodi surfaces those
+        differently in its subtitle picker."""
+        cap_list = (((data or {}).get("captions") or {})
+                    .get("playerCaptionsTracklistRenderer") or {})
+        tracks = cap_list.get("captionTracks") or []
+        out = []
+        for t in tracks:
+            base = t.get("baseUrl")
+            if not base:
+                continue
+            # YouTube's default is a JSON3 envelope; WebVTT is what ISA needs.
+            # Strip any existing fmt= and append fmt=vtt + kind param (the
+            # latter is required for asr tracks to come back as VTT rather
+            # than the SRV1 timed-text format).
+            sep = "&" if "?" in base else "?"
+            vtt_url = re.sub(r"([?&])fmt=[^&]+", "", base)
+            vtt_url = vtt_url + sep + "fmt=vtt"
+            if not re.search(r"[?&]kind=", vtt_url):
+                vtt_url = vtt_url + "&kind=asr" if t.get("kind") == "asr" else vtt_url
+            vss = t.get("vssId") or ""
+            out.append({
+                "url": vtt_url,
+                "lang": (t.get("languageCode") or "und").lower(),
+                "name": t.get("name") or t.get("languageCode") or "",
+                "auto": t.get("kind") == "asr" or vss.startswith("a."),
+                "vssId": vss,
+            })
+        return out
 
     def harvested_streams(self):
         """Adaptive formats (with direct URLs) seen on the last player call."""
@@ -259,6 +303,10 @@ class PluginBridge(object):
     def harvested_muxed(self):
         """Muxed/progressive formats (with direct URLs) — single playable URLs."""
         return self._muxed_harvest
+
+    def harvested_captions(self):
+        """Caption tracks (auto + manual) for the last player call."""
+        return self._caption_harvest
 
     @staticmethod
     def _default_ua():

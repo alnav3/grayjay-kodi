@@ -124,6 +124,7 @@ def call(source_id, method, args):
             "result": value,
             "stream_harvest": bridge.harvested_streams(),
             "muxed_harvest": bridge.harvested_muxed(),
+            "caption_harvest": bridge.harvested_captions(),
         }
 
 

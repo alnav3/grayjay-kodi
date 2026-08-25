@@ -166,7 +166,8 @@ def select_formats(usable, max_height=0, adaptive=False):
     return chosen
 
 
-def build_mpd(formats, duration_ms=None, url_map=None, max_height=0, adaptive=False):
+def build_mpd(formats, duration_ms=None, url_map=None, max_height=0,
+              adaptive=False, captions=None, caption_url_map=None):
     """Return a DASH MPD string, or None if no usable formats are present.
 
     `formats` is YouTube's adaptiveFormats list. Video/audio are split into
@@ -176,6 +177,12 @@ def build_mpd(formats, duration_ms=None, url_map=None, max_height=0, adaptive=Fa
     BaseURL (used to route media through the loopback range proxy);
     `max_height`/`adaptive` drive representation selection (see
     select_formats).
+
+    `captions` is an optional list of {url, lang, name, auto} dicts (one
+    per subtitle track, both uploader-supplied and YouTube's auto-generated
+    ASR). They're emitted as a single `text/vtt` AdaptationSet with one
+    Representation per language; `caption_url_map` rewrites each track's
+    URL through the loopback proxy (HMAC-signed, same scheme as media).
     """
     usable = usable_formats(formats)
     if not usable:
@@ -292,6 +299,37 @@ def build_mpd(formats, duration_ms=None, url_map=None, max_height=0, adaptive=Fa
 
     if not sets:
         return None
+
+    if captions:
+        # DASH subtitle AdaptationSet. One text/vtt Representation per
+        # language; Kodi/ISA expose them in the subtitle picker, marking
+        # ASR-generated ones with the "(auto)" indicator when Label starts
+        # with that prefix.
+        seen = set()
+        text_reps = []
+        for cap in captions:
+            url = (caption_url_map(cap) if caption_url_map
+                   else cap.get("url"))
+            if not url or url in seen:
+                continue
+            seen.add(url)
+            lang = cap.get("lang") or "und"
+            base_name = cap.get("name") or lang
+            label = "%s (auto)" % base_name if cap.get("auto") else base_name
+            role_attr = ' role="forced"' if cap.get("forced") else ""
+            sub_id = "subs-%s" % lang
+            text_reps.append(
+                '<Representation id="%s" bandwidth="1000" codecs="wvtt" '
+                'mimeType="text/vtt"%s>'
+                '<Label>%s</Label>'
+                '<BaseURL>%s</BaseURL></Representation>' % (
+                    _esc(sub_id), role_attr, _esc(label), _esc(url)))
+        if text_reps:
+            sets.append(
+                '<AdaptationSet id="%d" contentType="text" mimeType="text/vtt" '
+                'subsegmentAlignment="true" subsegmentStartsWithSAP="1" '
+                'startWithSAP="1">%s</AdaptationSet>' % (
+                    len(sets), "".join(text_reps)))
 
     return (
         '<?xml version="1.0" encoding="UTF-8"?>\n'

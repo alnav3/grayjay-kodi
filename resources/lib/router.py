@@ -89,6 +89,7 @@ class RemoteBridge(object):
         self._port = port
         self._stream_harvest = []
         self._muxed_harvest = []
+        self._caption_harvest = []
 
     def call(self, method, args):
         import json
@@ -109,6 +110,7 @@ class RemoteBridge(object):
             raise RuntimeError(out.get("error") or ("HTTP %d" % he.code))
         self._stream_harvest = out.get("stream_harvest") or []
         self._muxed_harvest = out.get("muxed_harvest") or []
+        self._caption_harvest = out.get("caption_harvest") or []
         return out.get("result")
 
     def harvested_streams(self):
@@ -116,6 +118,9 @@ class RemoteBridge(object):
 
     def harvested_muxed(self):
         return self._muxed_harvest
+
+    def harvested_captions(self):
+        return self._caption_harvest
 
     @staticmethod
     def save_state():
@@ -1059,6 +1064,14 @@ class Router(object):
                                              content_length=content_length,
                                              mime=mime)
 
+        captions = (bridge.harvested_captions()
+                    if hasattr(bridge, "harvested_captions") else [])
+
+        def proxied_caption(cap):
+            return manifest_server.media_url(port, secret, cap.get("url"),
+                                             content_length=0,
+                                             mime="text/vtt")
+
         dur_ms = 0
         try:
             dur_ms = int((details or {}).get("duration") or 0) * 1000
@@ -1066,6 +1079,8 @@ class Router(object):
             dur_ms = 0
         manifest = mpd_builder.build_mpd(formats, dur_ms or None,
                                          url_map=proxied,
+                                         captions=captions,
+                                         caption_url_map=proxied_caption,
                                          max_height=max_height,
                                          adaptive=adaptive)
         if not manifest:
