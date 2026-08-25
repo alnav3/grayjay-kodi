@@ -164,6 +164,76 @@ _ADAPTATION_SET_RE = re.compile(r"<AdaptationSet\b.*?</AdaptationSet>", re.DOTAL
 _DURATION_RE = re.compile(r'mediaPresentationDuration="([^"]+)"')
 
 
+_VTT_ALIGN_RE = re.compile(r"\balign:(?:start|left|right|end)\b", re.IGNORECASE)
+_VTT_LINE_RE = re.compile(r"\bline:\s*\d+(?:\.\d+)?%?\b", re.IGNORECASE)
+_VTT_POSITION_RE = re.compile(r"\bposition:\s*\d+(?:\.\d+)?%?\b", re.IGNORECASE)
+
+_CENTER_STYLE_BLOCK = (
+    "STYLE\n"
+    "::cue(v) { align: center; }\n"
+    "::cue(b) { align: center; }\n"
+    "::cue(i) { align: center; }\n"
+    "::cue(u) { align: center; }\n"
+    "::cue { align: center; }\n"
+    "\n"
+)
+
+
+def _center_vtt(vtt_text):
+    """Rewrite YouTube's WebVTT cues so they render centred.
+
+    YouTube ships cues with `align:start` and explicit `line`/`position`
+    settings, which Kodi/ISA honour verbatim and end up rendering in the
+    bottom-left. We:
+      - replace `align:start|left|right|end` with `align:center` per cue
+      - strip `line:` / `position:` overrides (they pin the cue to the left
+        margin)
+      - prepend a `STYLE` block as a belt-and-braces default for renderers
+        that only honour ::cue() global styling."""
+    if "WEBVTT" not in vtt_text:
+        return vtt_text
+
+    lines = vtt_text.split("\n")
+    out = []
+    in_style = False
+    cue_started = False
+    inserted_style = False
+
+    for line in lines:
+        if not inserted_style:
+            stripped = line.lstrip()
+            if stripped.startswith("WEBVTT") or stripped.startswith("NOTE"):
+                out.append(line)
+                continue
+            out.append(_CENTER_STYLE_BLOCK.rstrip("\n"))
+            inserted_style = True
+
+        if line.strip().upper().startswith("STYLE"):
+            in_style = True
+            out.append(line)
+            continue
+        if in_style:
+            if line.strip() == "":
+                in_style = False
+            out.append(line)
+            continue
+
+        if "-->" in line:
+            cue_started = True
+            line = _VTT_POSITION_RE.sub("", line)
+            line = _VTT_LINE_RE.sub("", line)
+            line = re.sub(r"\s{2,}", " ", line).rstrip()
+            line = _VTT_ALIGN_RE.sub("align:center", line)
+            if "align:" not in line.lower():
+                line = line + " align:center"
+            out.append(line)
+            continue
+
+        out.append(line)
+
+    return "\n".join(out)
+
+
 def _build_combined_ump_mpd(manifests, port, token):
     duration = None
     adaptation_sets = []
@@ -403,6 +473,26 @@ def _make_handler(cache_dir, profile_dir):
                     content_range = up.get("Content-Range")
                 else:
                     status = 200
+
+                # YouTube's WebVTT cues ship with `align:start` (left) — we
+                # rewrite to `align:center` so subtitles render centred in
+                # Kodi's OSD. We also strip per-cue `line` / `position`
+                # overrides so the centre cue setting wins, and inject a
+                # STYLE block at the top for players that ignore cue-level
+                # alignment (some renderers only honour ::cue()).
+                is_vtt = (mime or "").lower().startswith("text/vtt") or \
+                         (up.get("Content-Type") or "").lower().startswith(
+                             "text/vtt")
+                if is_vtt:
+                    try:
+                        raw_bytes = b"".join(chunks)
+                        vtt_text = raw_bytes.decode("utf-8", "replace")
+                        vtt_text = _center_vtt(vtt_text)
+                        raw_bytes = vtt_text.encode("utf-8")
+                        chunks = (raw_bytes,)
+                        length = len(raw_bytes)
+                    except Exception:
+                        pass
 
                 self.send_response(status)
                 self.send_header("Content-Type",
