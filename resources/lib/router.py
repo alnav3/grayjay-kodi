@@ -458,8 +458,13 @@ class Router(object):
 
     def action_sub_feed(self):
         """Aggregate recent content across subscribed channels, newest first.
-        With ?group=<id>, restrict to that group's members."""
-        from .sources import subscriptions as subs, groups as grp
+        With ?group=<id>, restrict to that group's members.
+
+        Renders the cached feed immediately (what we knew about at the time
+        Kodi started) so the listing is never empty when 150+ subs need a
+        network round-trip, then kicks off a background refresh that
+        re-renders the listing in place once new items land."""
+        from .sources import subscriptions as subs, groups as grp, sub_feed_cache
         group_id = self.args.get("group")
         feed_subs = subs.list_subscriptions()
         if group_id:
@@ -472,16 +477,64 @@ class Router(object):
                                "This group has no channels yet — add some from 'Manage groups'",
                                False, "")])
                 return
-        collected = []
-        for s in feed_subs:
-            results = self._run(s["source"], "getChannelContents",
-                                [s["url"], None, None, [], None])
-            for v in results:
-                collected.append((s["source"], v))
-        # Newest first when items carry a datetime (unix seconds).
-        collected.sort(key=lambda sv: (sv[1].get("datetime") or 0), reverse=True)
-        items = [self._content_item(src, v, show_source=True) for src, v in collected]
-        self._render(items, content_type="videos")
+
+        cache_key = group_id or "__all__"
+        cached = sub_feed_cache.load(cache_key)
+
+        # First render: whatever the cache has (or empty listing if first
+        # boot). We render unconditionally — if cache is empty, the user
+        # gets the loading state; if it has items, they see them now.
+        if cached:
+            items = [self._content_item(src, v, show_source=True)
+                     for src, v in cached]
+            self._render(items, content_type="videos")
+        else:
+            self._render([(self.url_for(action="subscriptions"),
+                           "Loading subscriptions…",
+                           False, "")])
+
+        # Kick the refresh off in a background thread so the listing above
+        # is on screen while 150+ channels pay their network round-trip.
+        self._refresh_sub_feed(cache_key, feed_subs)
+
+    def _refresh_sub_feed(self, cache_key, feed_subs):
+        """Pull fresh channel contents, merge into the cache, and trigger a
+        Container.Refresh so the on-screen listing picks up new items.
+
+        Run from a daemon thread spawned at the end of action_sub_feed.
+        New items are inserted above older ones by datetime (newest first),
+        and the cache is deduped by (source, url) so reappearing videos
+        don't double up."""
+        import threading
+        from .sources import sub_feed_cache
+
+        def _worker():
+            collected = []
+            for s in feed_subs:
+                try:
+                    results = self._run(s["source"], "getChannelContents",
+                                        [s["url"], None, None, [], None])
+                except Exception as exc:
+                    log("sub_feed refresh: %s failed: %s" % (s["url"], exc),
+                        "warning")
+                    continue
+                for v in results:
+                    collected.append((s["source"], v))
+            collected.sort(key=lambda sv: (sv[1].get("datetime") or 0),
+                           reverse=True)
+            sub_feed_cache.save(cache_key, collected)
+            # Ask Kodi to re-read the listing so newly-arrived items
+            # appear. Container.Refresh is safe to call from a worker
+            # thread; xbmc marshals it onto the GUI thread.
+            if _HAS_KODI:
+                try:
+                    xbmc.executebuiltin("Container.Refresh")
+                except Exception:
+                    pass
+
+        t = threading.Thread(target=_worker, name="grayjay-subfeed-refresh",
+                             daemon=True)
+        t.start()
 
     # -- subscription groups ----------------------------------------------
     def action_groups(self):

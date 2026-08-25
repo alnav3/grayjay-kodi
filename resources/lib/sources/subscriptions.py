@@ -50,6 +50,7 @@ def add_subscription(source_id, url, name="", thumbnail=""):
     subs.append({"source": source_id, "url": url,
                  "name": name or url, "thumbnail": thumbnail})
     _save(subs)
+    _invalidate_feed_cache()
     log("subscribed: %s (%s)" % (name or url, source_id), "info")
     return True
 
@@ -60,5 +61,16 @@ def remove_subscription(source_id, url):
     if len(new) == len(subs):
         return False
     _save(new)
+    _invalidate_feed_cache()
     log("unsubscribed: %s (%s)" % (url, source_id), "info")
     return True
+
+
+def _invalidate_feed_cache():
+    """Drop the cached aggregated feed so the next open rebuilds it
+    instead of replaying items from a channel the user just (un)followed."""
+    try:
+        from . import sub_feed_cache
+        sub_feed_cache.clear()
+    except Exception:
+        pass

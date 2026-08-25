@@ -167,6 +167,12 @@ _DURATION_RE = re.compile(r'mediaPresentationDuration="([^"]+)"')
 _VTT_ALIGN_RE = re.compile(r"\balign:(?:start|left|right|end)\b", re.IGNORECASE)
 _VTT_LINE_RE = re.compile(r"\bline:\s*\d+(?:\.\d+)?%?\b", re.IGNORECASE)
 _VTT_POSITION_RE = re.compile(r"\bposition:\s*\d+(?:\.\d+)?%?\b", re.IGNORECASE)
+# YouTube's ASR cues wrap every word in <c.color_youtube_blue>…</c> so the
+# renderer can colour the currently-spoken word. Strip those tags so each
+# cue shows as a single, unchanging line (we still get new lines per cue
+# change, just no per-word karaoke effect).
+_VTT_CLASS_TAG_RE = re.compile(
+    r"<\/?c(?:\.[A-Za-z0-9_\-]+)?>", re.IGNORECASE)
 
 _CENTER_STYLE_BLOCK = (
     "STYLE\n"
@@ -229,7 +235,11 @@ def _center_vtt(vtt_text):
             out.append(line)
             continue
 
-        out.append(line)
+        # Strip <c.classname>…</c> word-highlighting tags from cue bodies.
+        # We do this on the *body* lines (anything that's not WEBVTT /
+        # STYLE / NOTE / cue timing / blank separator) so the cue keeps
+        # its timestamp + alignment while losing the karaoke effect.
+        out.append(_VTT_CLASS_TAG_RE.sub("", line))
 
     return "\n".join(out)
 
