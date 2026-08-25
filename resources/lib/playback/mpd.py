@@ -206,12 +206,19 @@ def build_mpd(formats, duration_ms=None, url_map=None, max_height=0, adaptive=Fa
     # group -> OrderedDict keyed by (lang, itag) so dubbed and original
     # audio (same itag, different audioTrack.id / xtags) don't collapse.
     # Video tracks still dedupe purely by itag (no language to distinguish).
+    # Original audio lives in its own slot (lang="") so we can mark the
+    # whole AdaptationSet default="true" — inputstream.adaptive will then
+    # pick it when no explicit language preference matches.
     groups = OrderedDict()
     for f in selected:
         base = _base_mime(f.get("mimeType"))
         typ = "audio" if base.startswith("audio") else "video"
         if typ == "audio":
-            lang = _audio_lang(f) or "und"
+            is_orig = _is_original_audio(f)
+            if is_orig:
+                lang = ""
+            else:
+                lang = _audio_lang(f) or "und"
             key = (typ, base, lang)
             sub_key = (lang, str(f.get("itag")))
         else:
@@ -221,8 +228,19 @@ def build_mpd(formats, duration_ms=None, url_map=None, max_height=0, adaptive=Fa
         if sub_key not in groups[key]:
             groups[key][sub_key] = f
 
+    # Put the original audio AdaptationSet first so ISA (which tends to
+    # pick the first match) and any DASH parser that just walks sets in
+    # order both land on it. The AdaptationSet also carries default="true"
+    # for spec-compliant clients.
+    audio_keys = [k for k in groups if k[0] == "audio"]
+    other_keys = [k for k in groups if k[0] != "audio"]
+    audio_keys.sort(key=lambda k: (0 if k[2] == "" else 1, k[2] or ""))
+    ordered_keys = audio_keys + other_keys
+
     sets = []
-    for set_id, ((typ, base, lang), reps_by_sub) in enumerate(groups.items()):
+    for set_id, key in enumerate(ordered_keys):
+        typ, base, lang = key
+        reps_by_sub = groups[key]
         reps = []
         for sub_key, f in sorted(reps_by_sub.items(),
                                  key=lambda kv: _bandwidth(kv[1])):
@@ -241,7 +259,7 @@ def build_mpd(formats, duration_ms=None, url_map=None, max_height=0, adaptive=Fa
                         f.get("fps") or 30, _esc(url), seg))
             else:
                 track_lang = _audio_lang(f)
-                if not track_lang and lang != "und":
+                if not track_lang and lang != "und" and lang:
                     track_lang = lang
                 if track_lang:
                     rep_id = "%s-%s" % (f.get("itag"), track_lang)
@@ -249,14 +267,9 @@ def build_mpd(formats, duration_ms=None, url_map=None, max_height=0, adaptive=Fa
                 else:
                     rep_id = str(f.get("itag"))
                     track_label = ""
-                # default="true" on the original track tells ISA to pick it
-                # when no language preference matches (Kodi's
-                # locale.audiolanguage=original).
                 rep_attrs = ' id="%s" bandwidth="%d" codecs="%s" mimeType="%s" audioSamplingRate="%s"' % (
                     _esc(rep_id), bw, codecs, base,
                     f.get("audioSampleRate") or 48000)
-                if _is_original_audio(f):
-                    rep_attrs += ' default="true"'
                 reps.append(
                     '<Representation%s>'
                     '<AudioChannelConfiguration '
@@ -269,11 +282,13 @@ def build_mpd(formats, duration_ms=None, url_map=None, max_height=0, adaptive=Fa
         if not reps:
             continue
         lang_attr = ' lang="%s"' % _esc(lang) if lang and lang != "und" else ""
+        is_default = (typ == "audio" and lang == "")
+        default_attr = ' default="true"' if is_default else ""
         sets.append(
-            '<AdaptationSet id="%d" contentType="%s" mimeType="%s"%s '
+            '<AdaptationSet id="%d" contentType="%s" mimeType="%s"%s%s '
             'subsegmentAlignment="true" subsegmentStartsWithSAP="1" '
             'startWithSAP="1">%s</AdaptationSet>' % (
-                set_id, typ, base, lang_attr, "".join(reps)))
+                set_id, typ, base, lang_attr, default_attr, "".join(reps)))
 
     if not sets:
         return None
