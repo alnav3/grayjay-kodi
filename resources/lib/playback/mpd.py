@@ -71,6 +71,48 @@ def _is_audio(f):
     return _base_mime(f.get("mimeType")).startswith("audio")
 
 
+def _is_original_audio(f):
+    """True if this format is the video's original audio (not a dubbed alt).
+
+    YouTube tags each audio track with `audioTrack` (id like "original" or
+    "dub_<lang>", plus a `audioIsDefault` flag) and stamps dubbed-auto tracks
+    with `xtags=acont=dubbed-auto:lang=<code>`. The original/default track
+    is what viewers expect when their locale doesn't match the dub; the
+    bitrate-maximising sort below would otherwise happily pick a Hindi
+    auto-dub over the English original because the dub often wins on
+    bitrate."""
+    track = f.get("audioTrack") or {}
+    if track.get("id") == "original":
+        return True
+    if track.get("audioIsDefault") or f.get("audioIsDefault"):
+        return True
+    xtags = f.get("xtags") or ""
+    if "dubbed-auto" in xtags or xtags.startswith("acont=dub"):
+        return False
+    return False
+
+
+def _audio_lang(f):
+    """Best-effort ISO 639-1 code for an audio track, or '' if unknown.
+
+    The MPD AdaptationSet's `lang` attribute is what `inputstream.adaptive`
+    matches against Kodi's `locale.audiolanguage` (default "original"); with
+    no `lang` that setting is a no-op, so we always carry the tag when we
+    can derive one. Prefer `audioTrack.id` (e.g. "dub_zh-Hans" -> "zh"), then
+    the BCP-47 in `xtags`."""
+    track = f.get("audioTrack") or {}
+    tid = (track.get("id") or "").lower()
+    if tid.startswith("dub_"):
+        tid = tid[4:]
+    if tid and tid != "original":
+        return tid.split("-")[0].lower()
+    xtags = f.get("xtags") or ""
+    m = re.search(r"lang=([a-zA-Z-]+)", xtags)
+    if m:
+        return m.group(1).split("-")[0].lower()
+    return ""
+
+
 def _codec_rank(f):
     """Lower is better. Prefer H.264 — universally hardware-decoded on the
     Kodi targets we care about — then VP9, then AV1."""
@@ -117,7 +159,8 @@ def select_formats(usable, max_height=0, adaptive=False):
         videos.sort(key=lambda f: (_height(f), -_codec_rank(f), _fps(f), _bandwidth(f)))
         chosen.append(videos[-1])
     if audios:
-        audios.sort(key=lambda f: (_base_mime(f.get("mimeType")) == "audio/mp4",
+        audios.sort(key=lambda f: (not _is_original_audio(f),
+                                   _base_mime(f.get("mimeType")) == "audio/mp4",
                                    _bandwidth(f)))
         chosen.append(audios[-1])
     return chosen
@@ -155,6 +198,7 @@ def build_mpd(formats, duration_ms=None, url_map=None, max_height=0, adaptive=Fa
     sets = []
     for set_id, ((typ, base), reps_by_itag) in enumerate(groups.items()):
         reps = []
+        set_lang = ""
         for itag, f in sorted(reps_by_itag.items(), key=lambda kv: _bandwidth(kv[1])):
             codecs = _codecs(f.get("mimeType"))
             bw = _bandwidth(f)
@@ -170,21 +214,26 @@ def build_mpd(formats, duration_ms=None, url_map=None, max_height=0, adaptive=Fa
                         itag, bw, codecs, base, f.get("width"), f.get("height"),
                         f.get("fps") or 30, _esc(url), seg))
             else:
+                lang = _audio_lang(f)
+                if lang and not set_lang:
+                    set_lang = lang
+                rep_id = itag if not lang else "%s-%s" % (itag, lang)
                 reps.append(
                     '<Representation id="%s" bandwidth="%d" codecs="%s" '
                     'mimeType="%s" audioSamplingRate="%s">'
                     '<AudioChannelConfiguration '
                     'schemeIdUri="urn:mpeg:dash:23003:3:audio_channel_configuration:2011" '
                     'value="%s"/><BaseURL>%s</BaseURL>%s</Representation>' % (
-                        itag, bw, codecs, base, f.get("audioSampleRate") or 48000,
+                        _esc(rep_id), bw, codecs, base, f.get("audioSampleRate") or 48000,
                         f.get("audioChannels") or 2, _esc(url), seg))
         if not reps:
             continue
+        lang_attr = ' lang="%s"' % _esc(set_lang) if set_lang else ""
         sets.append(
-            '<AdaptationSet id="%d" contentType="%s" mimeType="%s" '
+            '<AdaptationSet id="%d" contentType="%s" mimeType="%s"%s '
             'subsegmentAlignment="true" subsegmentStartsWithSAP="1" '
             'startWithSAP="1">%s</AdaptationSet>' % (
-                set_id, typ, base, "".join(reps)))
+                set_id, typ, base, lang_attr, "".join(reps)))
 
     if not sets:
         return None
