@@ -284,13 +284,24 @@ class PluginBridge(object):
             sep = "&" if "?" in base else "?"
             vtt_url = re.sub(r"([?&])fmt=[^&]+", "", base)
             vtt_url = vtt_url + sep + "fmt=vtt"
-            if not re.search(r"[?&]kind=", vtt_url):
-                vtt_url = vtt_url + "&kind=asr" if t.get("kind") == "asr" else vtt_url
+            if t.get("kind") == "asr" and not re.search(r"[?&]kind=", vtt_url):
+                vtt_url = vtt_url + "&kind=asr"
             vss = t.get("vssId") or ""
+            # `name` is a {runs: [{text: ...}]} struct; flatten to a string.
+            name_obj = t.get("name") or {}
+            name_text = ""
+            if isinstance(name_obj, dict):
+                runs = name_obj.get("runs") or []
+                name_text = "".join(
+                    r.get("text", "") for r in runs if isinstance(r, dict))
+            elif isinstance(name_obj, str):
+                name_text = name_obj
+            if not name_text:
+                name_text = t.get("languageCode") or ""
             out.append({
                 "url": vtt_url,
                 "lang": (t.get("languageCode") or "und").lower(),
-                "name": t.get("name") or t.get("languageCode") or "",
+                "name": name_text,
                 "auto": t.get("kind") == "asr" or vss.startswith("a."),
                 "vssId": vss,
             })

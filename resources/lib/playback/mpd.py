@@ -301,35 +301,44 @@ def build_mpd(formats, duration_ms=None, url_map=None, max_height=0,
         return None
 
     if captions:
-        # DASH subtitle AdaptationSet. One text/vtt Representation per
-        # language; Kodi/ISA expose them in the subtitle picker, marking
-        # ASR-generated ones with the "(auto)" indicator when Label starts
-        # with that prefix.
-        seen = set()
-        text_reps = []
+        # DASH subtitle AdaptationSets: one per language, one Representation
+        # per (lang, auto/manual) pair. Manual track goes first inside each
+        # AdaptationSet so ISA picks it by default when both are available.
+        # If only an ASR track exists for a language, that language is still
+        # offered with "(auto)" in the label.
+        by_lang = OrderedDict()
         for cap in captions:
-            url = (caption_url_map(cap) if caption_url_map
-                   else cap.get("url"))
-            if not url or url in seen:
+            lang = (cap.get("lang") or "und").lower()
+            by_lang.setdefault(lang, []).append(cap)
+        for lang, caps in by_lang.items():
+            caps.sort(key=lambda c: bool(c.get("auto")))  # manual first
+            reps = []
+            seen = set()
+            for idx, cap in enumerate(caps):
+                url = (caption_url_map(cap) if caption_url_map
+                       else cap.get("url"))
+                if not url or url in seen:
+                    continue
+                seen.add(url)
+                base_name = cap.get("name") or lang
+                label = "%s (auto)" % base_name if cap.get("auto") else base_name
+                role_attr = ' role="forced"' if cap.get("forced") else ""
+                sub_id = "subs-%s-%d" % (lang, idx)
+                reps.append(
+                    '<Representation id="%s" bandwidth="1000" codecs="wvtt" '
+                    'mimeType="text/vtt"%s>'
+                    '<Label>%s</Label>'
+                    '<BaseURL>%s</BaseURL></Representation>' % (
+                        _esc(sub_id), role_attr, _esc(label), _esc(url)))
+            if not reps:
                 continue
-            seen.add(url)
-            lang = cap.get("lang") or "und"
-            base_name = cap.get("name") or lang
-            label = "%s (auto)" % base_name if cap.get("auto") else base_name
-            role_attr = ' role="forced"' if cap.get("forced") else ""
-            sub_id = "subs-%s" % lang
-            text_reps.append(
-                '<Representation id="%s" bandwidth="1000" codecs="wvtt" '
-                'mimeType="text/vtt"%s>'
-                '<Label>%s</Label>'
-                '<BaseURL>%s</BaseURL></Representation>' % (
-                    _esc(sub_id), role_attr, _esc(label), _esc(url)))
-        if text_reps:
+            default_attr = ' default="true"' if idx == 0 else ""
             sets.append(
                 '<AdaptationSet id="%d" contentType="text" mimeType="text/vtt" '
+                'lang="%s"%s '
                 'subsegmentAlignment="true" subsegmentStartsWithSAP="1" '
                 'startWithSAP="1">%s</AdaptationSet>' % (
-                    len(sets), "".join(text_reps)))
+                    len(sets), _esc(lang), default_attr, "".join(reps)))
 
     return (
         '<?xml version="1.0" encoding="UTF-8"?>\n'
