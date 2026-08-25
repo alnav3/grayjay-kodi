@@ -185,21 +185,47 @@ def build_mpd(formats, duration_ms=None, url_map=None, max_height=0, adaptive=Fa
         duration_ms = max((int(f.get("approxDurationMs") or 0) for f in usable),
                           default=0)
 
-    selected = select_formats(usable, max_height=max_height, adaptive=adaptive)
+    # For the MPD itself we want every distinct audio track the player
+    # response gave us (original + each dub), each in its own AdaptationSet
+    # keyed by language, so inputstream.adaptive can actually honour
+    # Kodi's `locale.audiolanguage=original` / explicit prefs. The
+    # single-audio select_formats path is still used by the router to
+    # decide which format's URL to sign for the proxy's first request,
+    # but here we surface them all.
+    videos = [f for f in usable if not _is_audio(f)]
+    audios = [f for f in usable if _is_audio(f)]
+    if max_height and videos:
+        capped = [f for f in videos if _height(f) <= max_height]
+        videos = capped or [min(videos, key=_height)]
+    if not adaptive:
+        if videos:
+            videos.sort(key=lambda f: (_height(f), -_codec_rank(f), _fps(f), _bandwidth(f)))
+            videos = [videos[-1]]
+    selected = videos + audios
 
-    # group -> OrderedDict keyed by itag (dedup, stable order)
+    # group -> OrderedDict keyed by (lang, itag) so dubbed and original
+    # audio (same itag, different audioTrack.id / xtags) don't collapse.
+    # Video tracks still dedupe purely by itag (no language to distinguish).
     groups = OrderedDict()
     for f in selected:
         base = _base_mime(f.get("mimeType"))
         typ = "audio" if base.startswith("audio") else "video"
-        key = (typ, base)
-        groups.setdefault(key, OrderedDict())[str(f.get("itag"))] = f
+        if typ == "audio":
+            lang = _audio_lang(f) or "und"
+            key = (typ, base, lang)
+            sub_key = (lang, str(f.get("itag")))
+        else:
+            key = (typ, base, "")
+            sub_key = str(f.get("itag"))
+        groups.setdefault(key, OrderedDict())
+        if sub_key not in groups[key]:
+            groups[key][sub_key] = f
 
     sets = []
-    for set_id, ((typ, base), reps_by_itag) in enumerate(groups.items()):
+    for set_id, ((typ, base, lang), reps_by_sub) in enumerate(groups.items()):
         reps = []
-        set_lang = ""
-        for itag, f in sorted(reps_by_itag.items(), key=lambda kv: _bandwidth(kv[1])):
+        for sub_key, f in sorted(reps_by_sub.items(),
+                                 key=lambda kv: _bandwidth(kv[1])):
             codecs = _codecs(f.get("mimeType"))
             bw = _bandwidth(f)
             url = url_map(f) if url_map else f.get("url")
@@ -211,24 +237,38 @@ def build_mpd(formats, duration_ms=None, url_map=None, max_height=0, adaptive=Fa
                     '<Representation id="%s" bandwidth="%d" codecs="%s" '
                     'mimeType="%s" width="%s" height="%s" frameRate="%s">'
                     '<BaseURL>%s</BaseURL>%s</Representation>' % (
-                        itag, bw, codecs, base, f.get("width"), f.get("height"),
+                        sub_key, bw, codecs, base, f.get("width"), f.get("height"),
                         f.get("fps") or 30, _esc(url), seg))
             else:
-                lang = _audio_lang(f)
-                if lang and not set_lang:
-                    set_lang = lang
-                rep_id = itag if not lang else "%s-%s" % (itag, lang)
+                track_lang = _audio_lang(f)
+                if not track_lang and lang != "und":
+                    track_lang = lang
+                if track_lang:
+                    rep_id = "%s-%s" % (f.get("itag"), track_lang)
+                    track_label = " (%s)" % track_lang
+                else:
+                    rep_id = str(f.get("itag"))
+                    track_label = ""
+                # default="true" on the original track tells ISA to pick it
+                # when no language preference matches (Kodi's
+                # locale.audiolanguage=original).
+                rep_attrs = ' id="%s" bandwidth="%d" codecs="%s" mimeType="%s" audioSamplingRate="%s"' % (
+                    _esc(rep_id), bw, codecs, base,
+                    f.get("audioSampleRate") or 48000)
+                if _is_original_audio(f):
+                    rep_attrs += ' default="true"'
                 reps.append(
-                    '<Representation id="%s" bandwidth="%d" codecs="%s" '
-                    'mimeType="%s" audioSamplingRate="%s">'
+                    '<Representation%s>'
                     '<AudioChannelConfiguration '
                     'schemeIdUri="urn:mpeg:dash:23003:3:audio_channel_configuration:2011" '
-                    'value="%s"/><BaseURL>%s</BaseURL>%s</Representation>' % (
-                        _esc(rep_id), bw, codecs, base, f.get("audioSampleRate") or 48000,
-                        f.get("audioChannels") or 2, _esc(url), seg))
+                    'value="%s"/><Label>%s</Label>'
+                    '<BaseURL>%s</BaseURL>%s</Representation>' % (
+                        rep_attrs, f.get("audioChannels") or 2,
+                        _esc((f.get("audioTrack") or {}).get("displayName", "") + track_label),
+                        _esc(url), seg))
         if not reps:
             continue
-        lang_attr = ' lang="%s"' % _esc(set_lang) if set_lang else ""
+        lang_attr = ' lang="%s"' % _esc(lang) if lang and lang != "und" else ""
         sets.append(
             '<AdaptationSet id="%d" contentType="%s" mimeType="%s"%s '
             'subsegmentAlignment="true" subsegmentStartsWithSAP="1" '
