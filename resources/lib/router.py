@@ -466,7 +466,7 @@ class Router(object):
         is empty (first boot, or no subs), we fall back to a synchronous
         one-shot fetch so the listing still works."""
         from .sources import subscriptions as subs, groups as grp
-        from .sources import sub_feed_cache
+        from .sources.sub_feed_cache import load as _subfeed_load, save as _subfeed_save
         group_id = self.args.get("group")
         feed_subs = subs.list_subscriptions()
         if group_id:
@@ -481,7 +481,7 @@ class Router(object):
                 return
 
         cache_key = group_id or "__all__"
-        cached = sub_feed_cache.load(cache_key)
+        cached = _subfeed_load(cache_key)
 
         if cached:
             items = [self._content_item(src, v, show_source=True)
@@ -501,7 +501,7 @@ class Router(object):
                 collected.append((s["source"], v))
         collected.sort(key=lambda sv: (sv[1].get("datetime") or 0),
                        reverse=True)
-        sub_feed_cache.save(cache_key, collected)
+        _subfeed_save(cache_key, collected)
         items = [self._content_item(src, v, show_source=True)
                  for src, v in collected]
         self._render(items, content_type="videos")

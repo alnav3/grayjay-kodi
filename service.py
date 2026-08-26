@@ -88,7 +88,7 @@ def _refresh_sub_feed():
     it (or whenever Kodi's home-widget refresher decides to redraw)."""
     try:
         from resources.lib.sources import subscriptions as subs, groups as grp
-        from resources.lib.sources import sub_feed_cache
+        from resources.lib.sources.sub_feed_cache import save as _subfeed_save, clear as _subfeed_clear
         from resources.lib.engine.bridge import create_enabled_bridge
     except Exception as exc:
         log("service: subfeed refresh import failed: %s" % exc, "warning")
@@ -96,7 +96,7 @@ def _refresh_sub_feed():
 
     feed_subs = subs.list_subscriptions()
     if not feed_subs:
-        sub_feed_cache.save("__all__", [])
+        _subfeed_save("__all__", [])
         return
 
     log("service: refreshing subscription feed (%d channel(s))" % len(feed_subs),
@@ -122,19 +122,19 @@ def _refresh_sub_feed():
                 "warning")
             continue
     collected.sort(key=lambda sv: (sv[1].get("datetime") or 0), reverse=True)
-    sub_feed_cache.save("__all__", collected)
+    _subfeed_save("__all__", collected)
 
     # Per-group caches too, so opening "group X" is also instant.
     for g in grp.list_groups():
         members = {(m.get("source"), m.get("url"))
                    for m in g.get("members", [])}
         if not members:
-            sub_feed_cache.save(g["id"], [])
+            _subfeed_save(g["id"], [])
             continue
         filtered = [(src, v) for src, v in collected
                     if (src, v.get("url")) in members]
         filtered.sort(key=lambda sv: (sv[1].get("datetime") or 0), reverse=True)
-        sub_feed_cache.save(g["id"], filtered)
+        _subfeed_save(g["id"], filtered)
 
     log("service: subfeed refresh done (%d item(s))" % len(collected), "info")
 
