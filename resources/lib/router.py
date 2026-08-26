@@ -451,8 +451,9 @@ class Router(object):
                 ("Delete group",
                  "RunPlugin(%s)" % self.url_for(action="group_delete", group=g["id"])),
             ]
-        items.append((self.url_for(action="sub_feed", group=g["id"]),
-                      "%s  (%d)" % (g.get("name", g["id"]), n), True, "", None, ctx))
+            items.append((self.url_for(action="sub_feed", group=g["id"]),
+                          "%s  (%d)" % (g.get("name", g["id"]), n), True, "",
+                          None, ctx))
         items.append((self.url_for(action="groups"), "[ Manage groups… ]", True, ""))
         items.append((self.url_for(action="sub_feed_refresh"),
                       "[ Refresh subscriptions now ]", False, "",
