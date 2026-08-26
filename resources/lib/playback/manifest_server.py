@@ -167,12 +167,11 @@ _DURATION_RE = re.compile(r'mediaPresentationDuration="([^"]+)"')
 _VTT_ALIGN_RE = re.compile(r"\balign:(?:start|left|right|end)\b", re.IGNORECASE)
 _VTT_LINE_RE = re.compile(r"\bline:\s*\d+(?:\.\d+)?%?\b", re.IGNORECASE)
 _VTT_POSITION_RE = re.compile(r"\bposition:\s*\d+(?:\.\d+)?%?\b", re.IGNORECASE)
-# YouTube's ASR cues wrap every word in <c.color_youtube_blue>…</c> so the
-# renderer can colour the currently-spoken word. Strip those tags so each
-# cue shows as a single, unchanging line (we still get new lines per cue
-# change, just no per-word karaoke effect).
-_VTT_CLASS_TAG_RE = re.compile(
-    r"<\/?c(?:\.[A-Za-z0-9_\-]+)?>", re.IGNORECASE)
+# YouTube marks the current word with an inline <HH:MM:SS.mmm> tag inside
+# the cue text — `word<00:00:01.500>` means "highlight `word` from
+# 1.5 s onward". Drop every such tag from cue bodies so the line shows as
+# a static, unchanging string per cue change.
+_VTT_INLINE_TAG_RE = re.compile(r"<[^>]+>")
 
 _CENTER_STYLE_BLOCK = (
     "STYLE\n"
@@ -235,11 +234,12 @@ def _center_vtt(vtt_text):
             out.append(line)
             continue
 
-        # Strip <c.classname>…</c> word-highlighting tags from cue bodies.
-        # We do this on the *body* lines (anything that's not WEBVTT /
-        # STYLE / NOTE / cue timing / blank separator) so the cue keeps
-        # its timestamp + alignment while losing the karaoke effect.
-        out.append(_VTT_CLASS_TAG_RE.sub("", line))
+        # Strip <HH:MM:SS.mmm> / <c.classname> word-highlighting tags from
+        # cue bodies. Anything in angle brackets is either a timing mark or
+        # a class wrapper — both are pure karaoke-effect metadata we don't
+        # want. Done on body lines only (timing lines + STYLE block keep
+        # their structure intact).
+        out.append(_VTT_INLINE_TAG_RE.sub("", line))
 
     return "\n".join(out)
 
