@@ -451,10 +451,43 @@ class Router(object):
                 ("Delete group",
                  "RunPlugin(%s)" % self.url_for(action="group_delete", group=g["id"])),
             ]
-            items.append((self.url_for(action="sub_feed", group=g["id"]),
-                          "%s  (%d)" % (g.get("name", g["id"]), n), True, "", None, ctx))
+        items.append((self.url_for(action="sub_feed", group=g["id"]),
+                      "%s  (%d)" % (g.get("name", g["id"]), n), True, "", None, ctx))
         items.append((self.url_for(action="groups"), "[ Manage groups… ]", True, ""))
+        items.append((self.url_for(action="sub_feed_refresh"),
+                      "[ Refresh subscriptions now ]", False, "",
+                      None,
+                      [("Refresh now",
+                        "RunPlugin(%s)" % self.url_for(action="sub_feed_refresh"))]))
         self._render(items)
+
+    def action_sub_feed_refresh(self):
+        """Manually trigger a subscription-feed cache refresh.
+
+        Goes through the manifest server's HTTP endpoint (which kicks the
+        background service into doing the work on its own thread) so the
+        UI doesn't block. Once the cache is rewritten the listing will
+        pick up new items on the next open / widget refresh."""
+        from .playback import manifest_server
+        from .kodiutils import profile_path
+        port = manifest_server.published_port(profile_path())
+        if not port:
+            notify("Refresh failed: service not running")
+            return
+        import json
+        import urllib.request
+        body = json.dumps({}).encode("utf-8")
+        req = urllib.request.Request(
+            "http://127.0.0.1:%d/subfeed/refresh" % port, data=body,
+            headers={"Content-Type": "application/json"}, method="POST")
+        try:
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                resp.read()
+            notify("Refreshing subscriptions in background…")
+        except Exception as exc:
+            notify("Refresh failed: %s" % exc)
+        if _HAS_KODI:
+            xbmc.executebuiltin("Container.Refresh")
 
     def action_sub_feed(self):
         """Aggregate recent content across subscribed channels, newest first.

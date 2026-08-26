@@ -81,62 +81,16 @@ def _start_manifest_server():
 def _refresh_sub_feed():
     """Rebuild the on-disk aggregated subscription feed.
 
-    The plugin process exits the instant it finishes rendering, so any
-    background work it spawns dies with it. The service is the only
-    long-lived Python in the addon — it owns the cache and keeps it
-    fresh so the Subscriptions listing is instant whenever the user opens
-    it (or whenever Kodi's home-widget refresher decides to redraw)."""
+    Delegates to sub_feed_cache.refresh_now() so the manifest server can
+    trigger the same routine over HTTP without us having to expose it
+    twice or worry about circular imports."""
     try:
-        from resources.lib.sources import subscriptions as subs, groups as grp
-        from resources.lib.sources.sub_feed_cache import save as _subfeed_save, clear as _subfeed_clear
-        from resources.lib.engine.bridge import create_enabled_bridge
+        from resources.lib.sources.sub_feed_cache import refresh_now
     except Exception as exc:
         log("service: subfeed refresh import failed: %s" % exc, "warning")
         return
-
-    feed_subs = subs.list_subscriptions()
-    if not feed_subs:
-        _subfeed_save("__all__", [])
-        return
-
-    log("service: refreshing subscription feed (%d channel(s))" % len(feed_subs),
-        "info")
-    collected = []
-    for s in feed_subs:
-        try:
-            bridge = create_enabled_bridge(s["source"])
-            if bridge is None:
-                continue
-            try:
-                results = bridge.call("getChannelContents",
-                                      [s["url"], None, None, [], None]) or []
-            finally:
-                try:
-                    bridge.close()
-                except Exception:
-                    pass
-            for v in results:
-                collected.append((s["source"], v))
-        except Exception as exc:
-            log("service: subfeed channel %s failed: %s" % (s.get("url"), exc),
-                "warning")
-            continue
-    collected.sort(key=lambda sv: (sv[1].get("datetime") or 0), reverse=True)
-    _subfeed_save("__all__", collected)
-
-    # Per-group caches too, so opening "group X" is also instant.
-    for g in grp.list_groups():
-        members = {(m.get("source"), m.get("url"))
-                   for m in g.get("members", [])}
-        if not members:
-            _subfeed_save(g["id"], [])
-            continue
-        filtered = [(src, v) for src, v in collected
-                    if (src, v.get("url")) in members]
-        filtered.sort(key=lambda sv: (sv[1].get("datetime") or 0), reverse=True)
-        _subfeed_save(g["id"], filtered)
-
-    log("service: subfeed refresh done (%d item(s))" % len(collected), "info")
+    n = refresh_now()
+    log("service: subfeed refresh done (%d item(s))" % n, "info")
 
 
 def main():

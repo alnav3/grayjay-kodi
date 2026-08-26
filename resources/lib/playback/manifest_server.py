@@ -300,6 +300,9 @@ def _make_handler(cache_dir, profile_dir):
             if self.path == "/session/call":
                 self._handle_session_call()
                 return
+            if self.path == "/subfeed/refresh":
+                self._handle_subfeed_refresh()
+                return
             self.send_error(404)
 
         # -- warm per-source bridge (see session_registry.py) ---------------
@@ -337,6 +340,27 @@ def _make_handler(cache_dir, profile_dir):
             self.send_header("Content-Length", str(len(data)))
             self.end_headers()
             self.wfile.write(data)
+
+        def _handle_subfeed_refresh(self):
+            """POST /subfeed/refresh — kick a subscription cache refresh
+            in the background service. Returns 202 immediately; the actual
+            network work runs on a daemon thread so this HTTP handler
+            returns right away (the plugin UI doesn't block)."""
+            try:
+                length = int(self.headers.get("Content-Length") or 0)
+                self.rfile.read(length) if length else b""
+            except Exception:
+                pass
+            try:
+                from resources.lib.sources.sub_feed_cache import refresh_now
+            except Exception as exc:
+                self._send_json({"error": "import failed: %s" % exc}, 500)
+                return
+            import threading
+            threading.Thread(target=refresh_now,
+                             name="subfeed-refresh-manual",
+                             daemon=True).start()
+            self._send_json({"status": "started"}, 202)
 
         # -- UMP/SABR fallback ---------------------------------------------
         def _handle_resolve(self):
