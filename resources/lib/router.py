@@ -465,7 +465,8 @@ class Router(object):
         handler just reads the cached result and renders it; if the cache
         is empty (first boot, or no subs), we fall back to a synchronous
         one-shot fetch so the listing still works."""
-        from .sources import subscriptions as subs, groups as grp, sub_feed_cache
+        from .sources import subscriptions as subs, groups as grp
+        from .sources import sub_feed_cache
         group_id = self.args.get("group")
         feed_subs = subs.list_subscriptions()
         if group_id:

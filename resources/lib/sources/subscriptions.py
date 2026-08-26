@@ -70,7 +70,7 @@ def _invalidate_feed_cache():
     """Drop the cached aggregated feed so the next open rebuilds it
     instead of replaying items from a channel the user just (un)followed."""
     try:
-        from . import sub_feed_cache
-        sub_feed_cache.clear()
+        from .sub_feed_cache import clear as _clear_cache
+        _clear_cache()
     except Exception:
         pass
