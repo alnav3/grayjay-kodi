@@ -26,6 +26,14 @@ _STARTUP_DELAY = 120          # let the box settle before hitting the network
 # Short tick: the player monitor polls playback position each pass (Kodi
 # reports no position once playback has stopped, so it must be sampled live).
 _TICK = 5
+# How often the service refreshes the subscription feed cache. Pulling
+# `getChannelContents` for 150+ subs is slow (tens of seconds), so we don't
+# want to do it on every plugin open; the cache exists so the listing is
+# instant. We also do one immediate refresh shortly after startup so a
+# fresh install / cleared cache doesn't show "Loading…" for the first half
+# hour.
+_SUBFEED_INTERVAL = 1800       # 30 minutes
+_SUBFEED_FIRST_DELAY = 180     # first refresh ~3 min after boot
 
 
 def _last_run():
@@ -70,6 +78,67 @@ def _start_manifest_server():
         return None
 
 
+def _refresh_sub_feed():
+    """Rebuild the on-disk aggregated subscription feed.
+
+    The plugin process exits the instant it finishes rendering, so any
+    background work it spawns dies with it. The service is the only
+    long-lived Python in the addon — it owns the cache and keeps it
+    fresh so the Subscriptions listing is instant whenever the user opens
+    it (or whenever Kodi's home-widget refresher decides to redraw)."""
+    try:
+        from resources.lib.sources import subscriptions as subs, groups as grp
+        from resources.lib.sources import sub_feed_cache
+        from resources.lib.engine.bridge import create_enabled_bridge
+    except Exception as exc:
+        log("service: subfeed refresh import failed: %s" % exc, "warning")
+        return
+
+    feed_subs = subs.list_subscriptions()
+    if not feed_subs:
+        sub_feed_cache.save("__all__", [])
+        return
+
+    log("service: refreshing subscription feed (%d channel(s))" % len(feed_subs),
+        "info")
+    collected = []
+    for s in feed_subs:
+        try:
+            bridge = create_enabled_bridge(s["source"])
+            if bridge is None:
+                continue
+            try:
+                results = bridge.call("getChannelContents",
+                                      [s["url"], None, None, [], None]) or []
+            finally:
+                try:
+                    bridge.close()
+                except Exception:
+                    pass
+            for v in results:
+                collected.append((s["source"], v))
+        except Exception as exc:
+            log("service: subfeed channel %s failed: %s" % (s.get("url"), exc),
+                "warning")
+            continue
+    collected.sort(key=lambda sv: (sv[1].get("datetime") or 0), reverse=True)
+    sub_feed_cache.save("__all__", collected)
+
+    # Per-group caches too, so opening "group X" is also instant.
+    for g in grp.list_groups():
+        members = {(m.get("source"), m.get("url"))
+                   for m in g.get("members", [])}
+        if not members:
+            sub_feed_cache.save(g["id"], [])
+            continue
+        filtered = [(src, v) for src, v in collected
+                    if (src, v.get("url")) in members]
+        filtered.sort(key=lambda sv: (sv[1].get("datetime") or 0), reverse=True)
+        sub_feed_cache.save(g["id"], filtered)
+
+    log("service: subfeed refresh done (%d item(s))" % len(collected), "info")
+
+
 def main():
     monitor = xbmc.Monitor()
     log("service started", "info")
@@ -81,6 +150,8 @@ def main():
         log("service: player monitor unavailable: %s" % exc, "warning")
         player = None
     started = time.time()
+    first_subfeed_done = False
+    last_subfeed_run = 0.0
 
     while not monitor.waitForAbort(_TICK):
         if player:
@@ -105,6 +176,22 @@ def main():
         if updates.auto_update_enabled() and (time.time() - _last_run()) >= interval:
             _run_check()
             _mark_run(time.time())
+
+        # Subscription feed cache: one refresh ~3 min after boot, then
+        # every _SUBFEED_INTERVAL seconds. The plugin reads from the
+        # cache synchronously, so this is what makes the listing load
+        # instantly for the user.
+        now = time.time()
+        subfeed_due = first_subfeed_done and (now - last_subfeed_run) >= _SUBFEED_INTERVAL
+        subfeed_first = (not first_subfeed_done
+                         and (now - started) >= _SUBFEED_FIRST_DELAY)
+        if subfeed_first or subfeed_due:
+            try:
+                _refresh_sub_feed()
+            except Exception as exc:
+                log("service: subfeed refresh failed: %s" % exc, "warning")
+            first_subfeed_done = True
+            last_subfeed_run = now
     if manifest_srv:
         manifest_srv.shutdown()
     try:
